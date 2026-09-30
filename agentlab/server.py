@@ -18,6 +18,7 @@ import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import urllib.parse
 from urllib.parse import urlsplit
 
 from .agent import Agent, SessionError
@@ -35,6 +36,24 @@ RESOURCES = PACKAGE / "resources"
 DOC_NAMES = ("architecture", "learning-path", "tools", "providers", "memory-workflows", "operations", "validation", "web-ui")
 IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 MAX_BODY = 2 * 1024 * 1024
+
+
+def _query_int(query, name, default):
+    """从查询串取一个非负整数参数。
+
+    缺失时返回默认值；**存在但非法时明确报错**，避免静默退化成 0 让客户端误以为
+    需要重新拉取全量事件。
+    """
+    values = urllib.parse.parse_qs(query).get(name)
+    if not values:
+        return default
+    try:
+        value = int(values[0])
+    except (TypeError, ValueError):
+        raise APIError(400, "%s 必须是非负整数" % name) from None
+    if value < 0:
+        raise APIError(400, "%s 必须是非负整数" % name)
+    return value
 
 
 class APIError(Exception):
@@ -264,6 +283,24 @@ class App:
                 raise APIError(404, "未找到后台任务")
             return copy.deepcopy({key: value for key, value in self._jobs[job_id].items() if not key.startswith("_")})
 
+    def job_events(self, job_id, since=0):
+        """增量获取任务事件，避免轮询时反复传输完整的 5000 条事件列表。
+
+        `since` 是客户端已见的事件数。它等于总数时返回空列表（正常的"无新事件"），
+        超出总数时同样返回空——**不能重发全量**，否则前端会反复重渲染同一批事件。
+        """
+        if type(since) is not int or since < 0:
+            raise APIError(400, "since 必须是非负整数")
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise APIError(404, "未找到后台任务")
+            events = job["events"]
+            start = min(since, len(events))
+            return {"job_id": job_id, "status": job["status"],
+                    "total": len(events), "since": start,
+                    "events": copy.deepcopy(events[start:])}
+
     def cancel(self, job_id):
         with self._lock:
             job = self._jobs.get(job_id)
@@ -343,6 +380,9 @@ class App:
             return self.store.ingest(directory)
 
     def api(self, method, path, payload):
+        # 查询串只用于 GET 的增量参数（如 since），路径匹配仍用不含查询串的部分。
+        split = urlsplit(path)
+        path, query = split.path, split.query
         if method == "GET":
             if path == "/api/health":
                 return {"app": "agentlab", "status": "ok"}
@@ -365,7 +405,10 @@ class App:
             if path.startswith("/api/sessions/"):
                 return self._session(path[len("/api/sessions/"):])
             if path.startswith("/api/jobs/"):
-                return self.job(path[len("/api/jobs/"):])
+                remainder = path[len("/api/jobs/"):]
+                if remainder.endswith("/events"):
+                    return self.job_events(remainder[:-len("/events")], since=_query_int(query, "since", 0))
+                return self.job(remainder)
             if path == "/api/knowledge":
                 return {"documents": self.store.list_documents(), "stats": self.store.knowledge_stats()}
             if path.startswith("/api/docs/"):
@@ -503,7 +546,11 @@ class App:
             def _dispatch(self, method):
                 try:
                     self._allowed()
-                    path = urlsplit(self.path).path
+                    # request_target 保留查询串交给 api()（增量拉取用 since 参数，
+                    # 剥掉会让 api() 永远读到空查询串）；path 仅用于静态资源路由匹配。
+                    # 注意不要与下面读取请求体的局部变量重名。
+                    request_target = self.path
+                    path = urlsplit(request_target).path
                     payload = {}
                     if method == "POST":
                         tokens = self.headers.get_all("X-AgentLab-Token", [])
@@ -530,7 +577,7 @@ class App:
                         if not isinstance(payload, dict):
                             raise APIError(400, "JSON 请求体必须为对象")
                     if path.startswith("/api/"):
-                        self._json(200, app.api(method, path, payload))
+                        self._json(200, app.api(method, request_target, payload))
                         return
                     static = {"/": ("index.html", "text/html"), "/index.html": ("index.html", "text/html"),
                               "/app.js": ("app.js", "application/javascript"), "/style.css": ("style.css", "text/css")}

@@ -111,3 +111,27 @@ async def complete(self, messages: list, tools: list) -> ModelResponse:
 OpenAI 的 `{"type": "function", "function": {...}}` 格式，或扁平的
 `{"name": "...", "description": "...", "parameters": {...}}` 格式。
 适配器的测试均模拟 HTTP，不读取真实 Key、不调用付费模型。
+
+## 流式输出
+
+`OpenAICompatibleProvider.stream()` 读取 SSE（`stream: true`），逐段回调正文增量，最后返回
+完整的 `ModelResponse`。它有三个刻意的取舍：
+
+- **只在没有工具可调用的回合使用**。带工具时需要在流里重组 `tool_calls` 的分片参数
+  （`index` 对齐、arguments 字符串拼接），收益低而正确性风险高；调用方应回退到 `complete()`。
+  `Agent._complete()` 就是这样判断的：只有"调用方提供了增量回调"且"本轮没有工具定义"
+  时才走流式。
+- **阻塞读取放进线程**。SSE 是阻塞 I/O，直接在事件循环里迭代会卡住整个 Agent；因此先由
+  `_stream_collect()` 在线程中读完并收集增量，回到事件循环后再触发回调。
+- **复用非流式的安全策略**：禁止重定向、4 MiB 上限、严格 JSON（拒绝重复键与 NaN）。
+  `finish_reason` 为 `length`（被截断）或 `content_filter` 时直接报错，不会把半句话当完整回答。
+
+命令行用 `--stream` 开启：
+
+```bash
+python3 -m agentlab run --stream '用三句话解释什么是 BM25'
+python3 -m agentlab chat --session work --stream
+```
+
+未实现 `stream()` 的 Provider（如 `DemoProvider`、`ScriptedProvider`）会自动回退到 `complete()`，
+不需要任何改动。

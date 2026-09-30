@@ -142,7 +142,8 @@ class Agent:
             raise OverflowError("当前轮上下文超过 max_context_chars；请缩短输入或降低工具输出上限")
         return [Message("system", self.config.system_prompt)] + [m for group in groups for m in group]
 
-    async def run(self, prompt: str, session_id: Optional[str] = None) -> AgentResult:
+    async def run(self, prompt: str, session_id: Optional[str] = None,
+                  on_delta: Optional[Callable] = None) -> AgentResult:
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt 不能为空")
         session_id = session_id or uuid.uuid4().hex[:16]
@@ -162,7 +163,7 @@ class Agent:
             state["messages"].append(Message("user", prompt).to_dict())
             self._save(state)
             self._emit(state, "run_started")
-            return await self._guarded_loop(state)
+            return await self._guarded_loop(state, on_delta)
         finally:
             self.store.release_session(session_id, owner)
 
@@ -203,13 +204,29 @@ class Agent:
         finally:
             self.store.release_session(session_id, owner)
 
-    async def _guarded_loop(self, state):
+    async def _complete(self, messages, on_delta=None):
+        """获取一次模型响应；在可能时使用流式以获得即时反馈。
+
+        流式仅在两种条件下启用：
+        1. 调用方提供了 `on_delta`（否则流式没有意义）；
+        2. Provider 实现了 `stream`。
+        带工具的回合仍走 `complete()`：在流里重组 tool_calls 的分片参数收益低、
+        正确性风险高，而工具回合的文字通常很短。
+        """
+        definitions = self.tools.definitions()
+        if on_delta is not None and not definitions:
+            method = getattr(self.provider, "stream", None)
+            if method is not None and callable(method):
+                return await method(messages, on_delta)
+        return await self.provider.complete(messages, definitions)
+
+    async def _guarded_loop(self, state, on_delta=None):
         started = time.monotonic()
         try:
             remaining = self.config.run_timeout - state.get("active_seconds", 0.0)
             if remaining <= 0:
                 raise asyncio.TimeoutError()
-            return await asyncio.wait_for(self._loop(state), timeout=remaining)
+            return await asyncio.wait_for(self._loop(state, on_delta), timeout=remaining)
         except asyncio.CancelledError:
             self._close_pending(state, "运行已取消，执行中的工具可能已生效")
             self._finish(state, "cancelled", "运行已取消")
@@ -230,7 +247,7 @@ class Agent:
             state["active_seconds"] = state.get("active_seconds", 0.0) + time.monotonic() - started
             self._save(state)
 
-    async def _loop(self, state):
+    async def _loop(self, state, on_delta=None):
         while True:
             if state["pending"]:
                 undecided = [x for x in state["pending"]
@@ -266,7 +283,7 @@ class Agent:
                 return self._finish(state, "limited", "达到 token 预算上限")
             messages = self._context(state)
             self._emit(state, "model_started", step=state["steps"] + 1)
-            response = await self.provider.complete(messages, self.tools.definitions())
+            response = await self._complete(messages, on_delta)
             if not isinstance(response, ModelResponse) or not isinstance(response.content, str):
                 raise ValueError("Provider 必须返回 ModelResponse，content 必须为字符串")
             if not isinstance(response.usage, Usage) or any(type(value) is not int or value < 0

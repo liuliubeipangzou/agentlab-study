@@ -226,11 +226,24 @@ async function sendPrompt() {
   poll();
 }
 async function approve(ids) { if (state.approving || !state.currentId) return; const id = state.currentId; state.approving = true; renderChat(); try { const result = await api("/api/sessions/" + encodeURIComponent(id) + "/approve", {approved_call_ids: ids}); trackJob(result.job_id, "run", result.session_id || id); if (id === state.currentId) await refreshCurrent(); toast(ids.length ? "已提交批准，Agent 将继续执行。" : "已拒绝写入操作，Agent 将继续处理结果。"); } finally { state.approving = false; renderChat(); } poll(); }
-function trackJob(id, kind, sessionId = null, metadata = {}) { if (!id) throw new Error("服务未返回任务编号，请刷新后查看会话状态。"); state.jobs.set(id, {id, kind, sessionId, status: "running", ...metadata}); updateJobButtons(); }
+function trackJob(id, kind, sessionId = null, metadata = {}) { if (!id) throw new Error("服务未返回任务编号，请刷新后查看会话状态。"); state.jobs.set(id, {id, kind, sessionId, status: "running", eventCursor: 0, ...metadata}); updateJobButtons(); }
 function updateJobButtons() { const active = kind => [...state.jobs.values()].some(job => job.kind === kind && job.status === "running"); busy($("#run-workflow"), active("workflow")); busy($("#run-evaluation"), active("evaluate")); busy($("#test-connection"), active("connection")); }
+async function pullJobEvents(job) {
+  // 只取游标之后的新事件，避免每次轮询都传输完整事件列表。
+  try {
+    const payload = await api("/api/jobs/" + encodeURIComponent(job.id) + "/events?since=" + (job.eventCursor || 0));
+    job.eventCursor = payload.total;
+    const fresh = payload.events || [];
+    // 运行中的任务直接由任务事件驱动轨迹面板，无需等待会话整体刷新。
+    if (fresh.length && state.current && job.sessionId === state.currentId) {
+      state.current.events = [...(state.current.events || []), ...fresh];
+      renderInspector();
+    }
+  } catch (_) { /* 增量失败不影响主流程，下一轮轮询会重试。 */ }
+}
 async function poll() {
   if (!state.ready || state.polling) return; state.polling = true;
-  try { const active = [...state.jobs.values()].filter(job => job.status === "running"); await Promise.all(active.map(async job => { try { const result = await api("/api/jobs/" + encodeURIComponent(job.id)); job.status = result.status; job.result = result.result; job.error = result.error; if (result.status !== "running") finishJob(job); } catch (error) { if (error.status === 404) { job.status = "failed"; job.error = "该任务已不在当前服务中，请检查会话是否需要恢复。"; finishJob(job); } } })); if (state.currentId) await refreshCurrent(); if (Date.now() - state.lastRefresh > 5000 || active.some(job => job.status !== "running")) await refreshSessions(); updateJobButtons(); }
+  try { const active = [...state.jobs.values()].filter(job => job.status === "running"); await Promise.all(active.map(async job => { try { const result = await api("/api/jobs/" + encodeURIComponent(job.id)); job.status = result.status; job.result = result.result; job.error = result.error; await pullJobEvents(job); if (result.status !== "running") finishJob(job); } catch (error) { if (error.status === 404) { job.status = "failed"; job.error = "该任务已不在当前服务中，请检查会话是否需要恢复。"; finishJob(job); } } })); if (state.currentId) await refreshCurrent(); if (Date.now() - state.lastRefresh > 5000 || active.some(job => job.status !== "running")) await refreshSessions(); updateJobButtons(); }
   catch (_) { /* Retry on the next poll; connection state is visible in the sidebar. */ }
   finally { state.polling = false; }
 }

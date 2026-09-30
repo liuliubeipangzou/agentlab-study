@@ -199,6 +199,122 @@ class OpenAICompatibleProvider:
                 await asyncio.sleep(delay)
         raise ProviderError("模型请求失败。")  # Defensive; loop always returns or raises.
 
+    async def stream(self, messages: List[Message], on_delta) -> ModelResponse:
+        """流式请求：逐段回调正文增量，最后返回完整 ModelResponse。
+
+        只在**没有工具可调用**的回合使用。带工具时需要在流里重组 tool_calls 的分片
+        参数，收益低而正确性风险高，因此调用方应回退到 `complete()`。
+        """
+        try:
+            payload = self._serialize(messages, [])
+        except (TypeError, ValueError, KeyError, AttributeError):
+            raise ProviderError("请求包含无效消息、非有限 JSON 值。") from None
+        streaming_payload = json.loads(payload.decode("utf-8"))
+        streaming_payload["stream"] = True
+        streaming_payload.pop("tools", None)
+        streaming_payload.pop("tool_choice", None)
+        encoded = json.dumps(streaming_payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                # 流式读取是阻塞 I/O，放进线程执行；增量先在后台收集，回到事件循环后回调。
+                deltas, content, usage, finish = await asyncio.to_thread(self._stream_collect, encoded)
+                for piece in deltas:
+                    if on_delta:
+                        on_delta(piece)
+                body = content
+                if finish == "length":
+                    raise ProviderError("模型响应达到输出上限；请提高 max_output_tokens 或缩短请求。")
+                if finish == "content_filter":
+                    raise ProviderError("模型 API 未提供可用响应（content_filter）。")
+                if not body:
+                    raise ProviderError("模型返回了空响应。")
+                return ModelResponse(content=body, tool_calls=[], usage=usage)
+            except _RetryableError as exc:
+                if attempt == self.max_retries:
+                    raise ProviderError(str(exc)) from None
+                delay = min(5.0, max(0.25 * (2 ** attempt), exc.retry_after))
+                await asyncio.sleep(delay)
+        raise ProviderError("模型请求失败。")
+
+    def _stream_collect(self, payload):
+        """在线程中读完整个 SSE 流，返回 (增量列表, 完整正文, usage, finish_reason)。"""
+        deltas, content, usage, finish = [], "", Usage(), None
+        for kind, value in self._stream_request(payload):
+            if kind == "delta":
+                deltas.append(value)
+                content += value
+            elif kind == "usage":
+                usage = value
+            elif kind == "finish":
+                finish = value
+        return deltas, content, usage, finish
+
+    def _stream_request(self, payload):
+        """同步读取 SSE 流，产出 ('delta'|'content'|'usage'|'finish', value)。"""
+        request = urllib.request.Request(self.base_url + "/chat/completions", data=payload,
+                                         headers={"Authorization": "Bearer " + self._api_key,
+                                                  "Content-Type": "application/json",
+                                                  "Accept": "text/event-stream"},
+                                         method="POST")
+        opener = urllib.request.build_opener(_NoRedirect())
+        try:
+            with opener.open(request, timeout=self.timeout) as response:
+                buffered = 0
+                for raw_line in response:
+                    buffered += len(raw_line)
+                    if buffered > self.MAX_RESPONSE_BYTES:
+                        raise ProviderError("模型流式响应超过 4 MiB 限制。")
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line or line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        return
+                    try:
+                        event = _strict_json(data)
+                    except ValueError:
+                        raise ProviderError("模型流式响应包含无效 JSON。") from None
+                    if not isinstance(event, dict):
+                        continue
+                    for item in event.get("choices") or []:
+                        if not isinstance(item, dict):
+                            continue
+                        delta = item.get("delta")
+                        if isinstance(delta, dict):
+                            piece = delta.get("content")
+                            if isinstance(piece, str) and piece:
+                                yield ("delta", piece)
+                        if item.get("finish_reason"):
+                            yield ("finish", item["finish_reason"])
+                    usage_data = event.get("usage")
+                    if isinstance(usage_data, dict):
+                        incoming = usage_data.get("prompt_tokens", 0)
+                        outgoing = usage_data.get("completion_tokens", 0)
+                        if type(incoming) is int and type(outgoing) is int and incoming >= 0 and outgoing >= 0:
+                            yield ("usage", Usage(input_tokens=incoming, output_tokens=outgoing))
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+            retry_after = 0.0
+            if exc.headers:
+                try:
+                    candidate = float(exc.headers.get("Retry-After", "0"))
+                    retry_after = min(5.0, max(0.0, candidate)) if math.isfinite(candidate) else 0.0
+                except (ValueError, TypeError):
+                    pass
+            exc.close()
+            if code == 429 or 500 <= code <= 599:
+                raise _RetryableError("模型 API 暂时不可用（HTTP %d）；请稍后重试。" % code, retry_after) from None
+            if code in (401, 403):
+                raise ProviderError("模型 API 认证或访问权限失败（HTTP %d）；请检查配置。" % code) from None
+            raise ProviderError("模型 API 拒绝请求（HTTP %d）。" % code) from None
+        except (urllib.error.URLError, socket.timeout, TimeoutError, OSError):
+            raise _RetryableError("无法连接模型 API 或请求超时；请检查网络与地址。") from None
+        except (ValueError, UnicodeError, RecursionError):
+            raise ProviderError("模型 API 返回无效流式数据。") from None
+
     def _serialize(self, messages, tools):
         serialized = []
         for message in messages:

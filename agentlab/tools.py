@@ -449,6 +449,15 @@ async def _recall(arguments: dict, context: ToolContext) -> Any:
     return await _memory_call(context, "recall", context.session_id, arguments["query"])
 
 
+async def _search_memory(arguments: dict, context: ToolContext) -> Any:
+    """跨会话检索长期记忆；可选地把当前会话排除在外。"""
+    results = await _memory_call(context, "search_memories", arguments["query"],
+                                 limit=arguments.get("limit", 5),
+                                 exclude_session=context.session_id if arguments.get("exclude_current") else None)
+    return {"count": len(results), "results": results,
+            "note": "包含其它会话中保存的记忆，属于用户私有数据，仅用于回答当前问题。"}
+
+
 def _parameters(properties: dict, required: list) -> dict:
     return {"type": "object", "properties": properties,
             "required": required, "additionalProperties": False}
@@ -537,6 +546,11 @@ def create_builtin_tools() -> ToolRegistry:
         _remember, risk="write"))
     registry.register(Tool("recall", "按关键词读取当前会话的键值记忆，空查询读取全部。",
         _parameters({"query": {"type": "string", "maxLength": 2000}}, ["query"]), _recall))
+    registry.register(Tool("search_memory",
+        "跨会话检索长期记忆（BM25 排序），用于找回之前会话中保存的偏好与事实。",
+        _parameters({"query": {"type": "string", "minLength": 1, "maxLength": 2000},
+                     "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                     "exclude_current": {"type": "boolean"}}, ["query"]), _search_memory))
 
     # ---- 联网能力：全部经过 netguard 的地址校验与响应限额 ----
     registry.register(Tool("web_search", "联网搜索网页，返回标题、链接与摘要。默认使用免密钥后端。",

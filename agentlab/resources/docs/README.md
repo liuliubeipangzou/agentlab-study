@@ -15,13 +15,20 @@ export AGENTLAB_BASE_URL='https://api.deepseek.com'         # 换成你的服务
 # 2. 用自然语言提任务
 python3 -m agentlab run '搜索一下 Python 3.13 的新特性，然后用 Python 算一下它们的数量'
 
-# 3. 交互式多轮对话
-python3 -m agentlab chat --session work
+# 3. 交互式多轮对话（--stream 可逐字输出）
+python3 -m agentlab chat --session work --stream
+
+# 4. 单次任务流式输出
+python3 -m agentlab run --stream '用三句话解释什么是 BM25'
 ```
+
+**流式说明**：`--stream` 只对**没有工具调用的回合**生效，此时模型文字会逐段打印。
+带工具的回合会回退为普通请求——在流里重组 `tool_calls` 的分片参数收益低而正确性风险高，
+而工具回合的正文通常很短。
 
 也可以在浏览器界面里配置：运行 `python3 -m agentlab serve --open`，在**设置**中填写模型、API 地址与 Key 并保存。**界面输入的 Key 只保留在服务内存中，停止服务后需重新填写。**
 
-## 内置工具（10 个）
+## 内置工具（11 个）
 
 | 工具 | 作用 | 风险 |
 | --- | --- | --- |
@@ -33,6 +40,7 @@ python3 -m agentlab chat --session work
 | `read_file` / `write_file` | 工作区内文件读写，写入需审批 | 读 / **写** |
 | `calculator` | AST 白名单数值计算，不使用 `eval` | 读 |
 | `remember` / `recall` | 会话级键值记忆，写入需审批 | **写** / 读 |
+| `search_memory` | **跨会话**长期记忆检索（BM25 + IDF 排序） | 读 |
 
 所有联网请求都经过内置的 **SSRF 防护**：拒绝回环、私网、链路本地、CGNAT 与云元数据地址（含 IPv6 与映射地址），DNS 解析出的每个地址都要通过校验，并在校验后的 IP 上建立连接以消除重绑定窗口；默认不自动跟随重定向，`Host`/`Content-Length` 等请求头禁止模型覆盖。
 
@@ -43,6 +51,25 @@ python3 -m agentlab chat --session work
 - 工作目录限制、路径规范化（`O_NOFOLLOW` + `dir_fd`）是教学级防线，**不是**操作系统沙箱。
 - 检索结果、网页正文、API 响应都是**不可信输入**，Agent 会被告知把它们当作数据而不是指令。
 - 所有数据（会话、消息、知识库）以**明文**存在本机 SQLite；不要把真实凭据写进会话或知识文件。
+
+## 记忆：会话内与跨会话
+
+三种记忆各自独立：
+
+| 类型 | 存储 | 作用域 | 检索方式 |
+| --- | --- | --- | --- |
+| 短期对话 | `sessions.messages` | 单个会话 | 按完整轮次裁剪后送入模型 |
+| 会话记忆 | `memories` 表 | 单个会话 | `recall`，子串匹配 |
+| **跨会话记忆** | `memories` 表 | **全部会话** | `search_memory`，BM25 + IDF 排序 |
+
+`search_memory` 让 Agent 能找回你在**其它会话**里保存过的偏好与事实（例如"我之前说用什么
+Python 版本"）。排序使用与知识库一致的 BM25，并用 IDF 抑制噪声：像"索"这类几乎每条记忆都
+含有的字权重趋近 0，只有真正罕见的词才有区分度；再叠加查询词覆盖率与相对分数门槛，
+避免"股票行情"因共享一个单字而误命中"检索笔记"。
+
+`exclude_current=true` 可把当前会话排除在外。检索结果带 `session_id`，可以追溯到来源会话。
+**这些记忆在会话之间是相互可见的**，属于个人偏好类数据；同机其它工具能读到本机 SQLite，
+因此不要往记忆里放密钥。
 
 ## 从命令行观察框架
 

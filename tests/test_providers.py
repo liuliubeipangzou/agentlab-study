@@ -235,3 +235,126 @@ class APIProviderTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeStreamResponse:
+    """模拟 http.client 的行迭代接口：产出 bytes 行，并支持上下文管理器。"""
+
+    def __init__(self, text):
+        self._lines = [(line + "\n").encode("utf-8") for line in text.split("\n")]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *arguments):
+        return False
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+def sse(*events):
+    """把若干字典或原始字符串拼成 SSE 文本。"""
+    parts = []
+    for event in events:
+        if isinstance(event, str):
+            parts.append(event)
+        else:
+            parts.append("data: " + json.dumps(event, ensure_ascii=False))
+    return "\n\n".join(parts) + "\n\n"
+
+
+def delta(content, finish=None):
+    return {"choices": [{"delta": {"content": content}, "finish_reason": finish}]}
+
+
+class StreamingTests(unittest.IsolatedAsyncioTestCase):
+    """流式解析：只用于无工具回合，且必须容忍分片与注释。"""
+
+    def setUp(self):
+        self.provider = OpenAICompatibleProvider("test-model", "sk-unit-test-placeholder",
+                                                 base_url="https://api.example.test/v1")
+
+    def stream_with(self, text):
+        opener = MagicMock()
+        opener.open.return_value = FakeStreamResponse(text)
+        return patch("agentlab.providers.urllib.request.build_opener", return_value=opener), opener
+
+    async def test_concatenates_deltas_and_reports_usage(self):
+        text = sse(delta("你好"), ": keep-alive", delta("，世界"), delta("！", "stop"),
+                   {"choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 7}},
+                   "data: [DONE]")
+        context, _ = self.stream_with(text)
+        pieces = []
+        with context:
+            response = await self.provider.stream([Message("user", "hi")], pieces.append)
+        self.assertEqual(pieces, ["你好", "，世界", "！"])
+        self.assertEqual(response.content, "你好，世界！")
+        self.assertEqual("".join(pieces), response.content)
+        self.assertEqual(response.tool_calls, [])
+        self.assertEqual((response.usage.input_tokens, response.usage.output_tokens), (11, 7))
+
+    async def test_request_declares_stream_and_omits_tools(self):
+        context, opener = self.stream_with(sse(delta("hi", "stop")))
+        with context:
+            await self.provider.stream([Message("user", "hi")], None)
+        payload = json.loads(opener.open.call_args.args[0].data.decode("utf-8"))
+        self.assertTrue(payload["stream"])
+        self.assertNotIn("tools", payload)
+        self.assertNotIn("tool_choice", payload)
+
+    async def test_length_finish_reason_is_rejected(self):
+        """被截断的流式响应不能当作完整回答。"""
+        context, _ = self.stream_with(sse(delta("半句话", "length")))
+        with context:
+            with self.assertRaises(ProviderError):
+                await self.provider.stream([Message("user", "hi")], None)
+
+    async def test_content_filter_is_rejected(self):
+        context, _ = self.stream_with(sse(delta("", "content_filter")))
+        with context:
+            with self.assertRaises(ProviderError):
+                await self.provider.stream([Message("user", "hi")], None)
+
+    async def test_empty_stream_is_rejected(self):
+        context, _ = self.stream_with(sse(delta("", "stop")))
+        with context:
+            with self.assertRaises(ProviderError):
+                await self.provider.stream([Message("user", "hi")], None)
+
+    async def test_invalid_json_chunk_is_rejected(self):
+        context, _ = self.stream_with("data: {not json}\n\n")
+        with context:
+            with self.assertRaises(ProviderError):
+                await self.provider.stream([Message("user", "hi")], None)
+
+    async def test_missing_usage_defaults_to_zero(self):
+        context, _ = self.stream_with(sse(delta("hi", "stop")))
+        with context:
+            response = await self.provider.stream([Message("user", "hi")], None)
+        self.assertEqual(response.usage.total_tokens, 0)
+        self.assertEqual(response.content, "hi")
+
+    async def test_missing_callback_is_allowed(self):
+        context, _ = self.stream_with(sse(delta("ok", "stop")))
+        with context:
+            response = await self.provider.stream([Message("user", "hi")], None)
+        self.assertEqual(response.content, "ok")
+
+    async def test_retry_then_success(self):
+        opener = MagicMock()
+        opener.open.side_effect = [http_error(503), FakeStreamResponse(sse(delta("恢复", "stop")))]
+        with patch("agentlab.providers.urllib.request.build_opener", return_value=opener), \
+                patch("agentlab.providers.asyncio.sleep", new_callable=AsyncMock):
+            response = await self.provider.stream([Message("user", "hi")], None)
+        self.assertEqual(response.content, "恢复")
+        self.assertEqual(opener.open.call_count, 2)
+
+    async def test_auth_failure_is_not_retried_and_is_sanitized(self):
+        opener = MagicMock()
+        opener.open.side_effect = http_error(401)
+        with patch("agentlab.providers.urllib.request.build_opener", return_value=opener):
+            with self.assertRaises(ProviderError) as raised:
+                await self.provider.stream([Message("user", "hi")], None)
+        self.assertEqual(opener.open.call_count, 1)
+        self.assertNotIn("secret-key-server", str(raised.exception))

@@ -23,13 +23,19 @@ def parser():
     root.add_argument("--workspace", default="workspace", help="工具可读写的唯一文件根目录")
     root.add_argument("--json", action="store_true", help="以 JSON 输出结果")
     root.add_argument("--verbose", action="store_true", help="在 stderr 实时显示运行事件")
+    root.add_argument("--stream", action="store_true",
+                      help="流式打印模型回复（无工具回合即时输出，需模型支持流式）")
+    # 同一个开关也挂到子命令上，使 `run --stream ...` 这种自然写法同样有效。
     root.add_argument("--max-steps", type=int, default=8)
     sub = root.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="执行一次任务")
     run.add_argument("prompt")
     run.add_argument("--session", help="继续已有会话")
+    run.add_argument("--stream", action="store_true", default=None,
+                     help="流式打印模型回复（无工具回合即时输出）")
     chat = sub.add_parser("chat", help="交互式多轮会话")
     chat.add_argument("--session")
+    chat.add_argument("--stream", action="store_true", default=None, help="流式打印模型回复")
     approve = sub.add_parser("approve", help="明确批准一次检查点中的操作")
     approve.add_argument("session")
     selection = approve.add_mutually_exclusive_group(required=True)
@@ -58,6 +64,28 @@ def emit(value):
     print(json.dumps(value, ensure_ascii=False, indent=2))
 
 
+def _delta_printer(args):
+    """构造流式增量打印回调；未开启 --stream 时返回 None。"""
+    if not getattr(args, "stream", False):
+        return None
+    state = {"wrote": False}
+
+    def on_delta(piece):
+        if not state["wrote"]:
+            # 增量第一次到达时才换行，避免与进度提示挤在同一行。
+            print()
+            state["wrote"] = True
+        sys.stdout.write(piece)
+        sys.stdout.flush()
+
+    return on_delta
+
+
+def _streaming(args):
+    """是否处于流式模式（仅真实模型支持）。"""
+    return bool(getattr(args, "stream", False)) and getattr(args, "provider", "") == "openai"
+
+
 def _tool_settings_from_env():
     """从环境变量读取工具配置（当前用于检索后端凭据）。"""
     settings = {}
@@ -69,11 +97,15 @@ def _tool_settings_from_env():
     return settings
 
 
-def show_result(result, as_json=False, args=None):
+def show_result(result, as_json=False, args=None, streamed=False):
     if as_json:
         emit(result.to_dict())
         return
-    print("\n" + result.output)
+    if streamed and result.output.strip():
+        # 正文已由流式增量打印，这里只补结尾换行，避免重复输出一遍。
+        print()
+    else:
+        print("\n" + result.output)
     print("\n[{}] session={} · steps={} · tools={} · tokens={}".format(
         result.status, result.session_id, result.steps, result.tool_calls, result.usage.total_tokens))
     if result.status == "waiting_approval":
@@ -157,7 +189,7 @@ async def dispatch(args):
                       config=AgentConfig(max_steps=args.max_steps), on_event=trace if args.verbose else None,
                       tool_settings=_tool_settings_from_env())
         if args.command == "run":
-            result = await agent.run(args.prompt, args.session)
+            result = await agent.run(args.prompt, args.session, on_delta=_delta_printer(args))
         elif args.command == "approve":
             state = store.load_session(args.session)
             if not state:
@@ -194,15 +226,15 @@ async def dispatch(args):
                         ids = [x["id"] for x in state.get("pending", []) if agent.tools.requires_approval(ToolCall.from_dict(x))] if prompt == "/approve" else []
                         result = await agent.resume(session, ids)
                     else:
-                        result = await agent.run(prompt, session)
+                        result = await agent.run(prompt, session, on_delta=_delta_printer(args))
                     session = result.session_id
-                    show_result(result, args.json, args)
+                    show_result(result, args.json, args, streamed=_streaming(args))
                     if result.status == "waiting_approval":
                         print("在聊天中输入 /approve 批准以上参数，或 /deny 拒绝。")
                 except (SessionError, ValueError) as exc:
                     print(str(exc), file=sys.stderr)
             return 0
-        show_result(result, args.json, args)
+        show_result(result, args.json, args, streamed=_streaming(args))
         return 0 if result.status in ("completed", "waiting_approval") else 1
     finally:
         store.close()
@@ -210,6 +242,9 @@ async def dispatch(args):
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    # 子命令上的 --stream 只覆盖全局值；未提供（None）时沿用全局开关。
+    if getattr(args, "stream", None) is None:
+        args.stream = False
     try:
         if args.command == "serve":
             # HTTP 服务自己管理后台任务，不嵌套在 CLI 的 asyncio 事件循环中。

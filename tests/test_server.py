@@ -290,3 +290,132 @@ class ServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IncrementalEventTests(unittest.TestCase):
+    """增量事件接口：必须通过真实 HTTP 验证。
+
+    这一层曾经出过一个只有走 HTTP 才会暴露的 bug：handler 在转发前用
+    `urlsplit(self.path).path` 把查询串剥掉了，导致 api() 永远读到空的 since，
+    每次都重发全量事件。直接调用 app.api() 的测试无法发现它。
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.environment = patch.dict("os.environ", {
+            "AGENTLAB_API_KEY": "", "AGENTLAB_MODEL": "deepseek-flash",
+            "AGENTLAB_BASE_URL": "https://api.deepseek.com",
+            "AGENTLAB_ALLOW_DEMO": "1", "AGENTLAB_PROVIDER": "demo"})
+        self.environment.start()
+        self.app = App(self.root / "data", self.root / "work")
+        self.addCleanup(self.app.close)
+        self.server = self.app.create_server(port=0)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self._stop_server)
+        self.token = self.request("GET", "/api/bootstrap")[1]["csrf_token"]
+
+    def _stop_server(self):
+        self.app.close()
+        self.thread.join(timeout=2)
+        self.environment.stop()
+        self.temp.cleanup()
+
+    def request(self, method, path, body=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        outgoing = {"Host": "127.0.0.1:{}".format(self.port)}
+        data = None
+        if method == "POST":
+            outgoing["Content-Type"] = "application/json"
+            outgoing["X-AgentLab-Token"] = self.token
+            data = json.dumps(body or {}).encode("utf-8")
+        try:
+            connection.request(method, path, body=data, headers=outgoing)
+            response = connection.getresponse()
+            raw = response.read().decode("utf-8")
+            value = json.loads(raw) if response.getheader("Content-Type", "").startswith("application/json") else raw
+            return response.status, value
+        finally:
+            connection.close()
+
+    def wait_job(self, job_id):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status, job = self.request("GET", "/api/jobs/" + job_id)
+            self.assertEqual(status, 200)
+            if job["status"] != "running":
+                return job
+            time.sleep(0.01)
+        self.fail("background job did not finish")
+
+    def _completed_job(self):
+        status, result = self.request("POST", "/api/run", {"prompt": "/calc 6*7"})
+        self.assertEqual(status, 200)
+        job = self.wait_job(result["job_id"])
+        self.assertEqual(job["status"], "completed")
+        return job
+
+    def test_events_endpoint_returns_full_history_by_default(self):
+        job = self._completed_job()
+        status, payload = self.request("GET", "/api/jobs/{}/events".format(job["job_id"]))
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["since"], 0)
+        self.assertEqual(len(payload["events"]), payload["total"])
+        self.assertGreater(payload["total"], 0)
+
+    def test_since_returns_only_new_events(self):
+        """查询串必须真正传到 api()，否则这里会返回全量。"""
+        job = self._completed_job()
+        total = job["total"] if "total" in job else None
+        status, full = self.request("GET", "/api/jobs/{}/events".format(job["job_id"]))
+        total = full["total"]
+        self.assertGreater(total, 1)
+        status, partial = self.request(
+            "GET", "/api/jobs/{}/events?since={}".format(job["job_id"], total - 1))
+        self.assertEqual(status, 200)
+        self.assertEqual(len(partial["events"]), 1)
+        self.assertEqual(partial["events"][0], full["events"][-1])
+
+    def test_cursor_at_end_returns_empty_and_never_repeats(self):
+        """游标等于总数时必须返回空，否则前端会反复重渲染同一批事件。"""
+        job = self._completed_job()
+        _, full = self.request("GET", "/api/jobs/{}/events".format(job["job_id"]))
+        for cursor in (full["total"], full["total"] + 1, 99999):
+            with self.subTest(cursor=cursor):
+                status, payload = self.request(
+                    "GET", "/api/jobs/{}/events?since={}".format(job["job_id"], cursor))
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["events"], [])
+
+    def test_invalid_cursor_is_rejected(self):
+        job = self._completed_job()
+        for value in ("abc", "-1", "1.5", "1e3"):
+            with self.subTest(value=value):
+                status, payload = self.request(
+                    "GET", "/api/jobs/{}/events?since={}".format(job["job_id"], value))
+                self.assertEqual(status, 400)
+                self.assertIn("since", payload["error"])
+
+    def test_empty_cursor_means_full_history(self):
+        """`since=` 空值等同未提供，返回全量而不是报错。"""
+        job = self._completed_job()
+        status, payload = self.request(
+            "GET", "/api/jobs/{}/events?since=".format(job["job_id"]))
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["since"], 0)
+        self.assertEqual(len(payload["events"]), payload["total"])
+
+    def test_unknown_job_returns_404(self):
+        status, _ = self.request("GET", "/api/jobs/nonexistent/events")
+        self.assertEqual(status, 404)
+
+    def test_query_string_does_not_break_static_or_other_routes(self):
+        """路由仍按不含查询串的路径匹配。"""
+        for path in ("/", "/app.js", "/style.css", "/?v=1"):
+            with self.subTest(path=path):
+                status, _ = self.request("GET", path)
+                self.assertEqual(status, 200)
+        status, _ = self.request("GET", "/api/health?probe=1")
+        self.assertEqual(status, 200)
