@@ -22,9 +22,9 @@ python3 -m agentlab chat --session work --stream
 python3 -m agentlab run --stream '用三句话解释什么是 BM25'
 ```
 
-**流式说明**：`--stream` 只对**没有工具调用的回合**生效，此时模型文字会逐段打印。
-带工具的回合会回退为普通请求——在流里重组 `tool_calls` 的分片参数收益低而正确性风险高，
-而工具回合的正文通常很短。
+**流式说明**：`--stream` 现在**支持工具调用回合**——流式分片里的 `tool_calls` 参数会按
+index 对齐重组，经完整校验后才执行，不会执行半截参数。未实现 `stream()` 的 Provider
+（如 `DemoProvider`）会自动回退到普通请求。
 
 也可以在浏览器界面里配置：运行 `python3 -m agentlab serve --open`，在**设置**中填写模型、API 地址与 Key 并保存。**界面输入的 Key 只保留在服务内存中，停止服务后需重新填写。**
 
@@ -213,7 +213,7 @@ agentlab/
   types.py         消息、工具调用、模型响应协议
   agent.py         Agent 状态机、审批、预算、恢复
   providers.py     三种模型实现
-  tools.py         工具注册、校验、6 个内置工具
+  tools.py         工具注册、校验、12 个内置工具
   storage.py       SQLite、记忆、知识索引、会话租约
   workflows.py     DAG 调度、并发、失败传播
   planning.py      结构化输出与计划执行

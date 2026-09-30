@@ -24,18 +24,18 @@ def parser():
     root.add_argument("--json", action="store_true", help="以 JSON 输出结果")
     root.add_argument("--verbose", action="store_true", help="在 stderr 实时显示运行事件")
     root.add_argument("--stream", action="store_true",
-                      help="流式打印模型回复（无工具回合即时输出，需模型支持流式）")
+                      help="流式打印模型回复，支持工具调用回合（需模型支持流式）")
     # 同一个开关也挂到子命令上，使 `run --stream ...` 这种自然写法同样有效。
     root.add_argument("--max-steps", type=int, default=8)
     sub = root.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="执行一次任务")
     run.add_argument("prompt")
     run.add_argument("--session", help="继续已有会话")
-    run.add_argument("--stream", action="store_true", default=None,
-                     help="流式打印模型回复（无工具回合即时输出）")
+    run.add_argument("--stream", action="store_true", default=argparse.SUPPRESS,
+                     help="流式打印模型回复")
     chat = sub.add_parser("chat", help="交互式多轮会话")
     chat.add_argument("--session")
-    chat.add_argument("--stream", action="store_true", default=None, help="流式打印模型回复")
+    chat.add_argument("--stream", action="store_true", default=argparse.SUPPRESS, help="流式打印模型回复")
     approve = sub.add_parser("approve", help="明确批准一次检查点中的操作")
     approve.add_argument("session")
     selection = approve.add_mutually_exclusive_group(required=True)
@@ -66,7 +66,7 @@ def emit(value):
 
 def _delta_printer(args):
     """构造流式增量打印回调；未开启 --stream 时返回 None。"""
-    if not getattr(args, "stream", False):
+    if not getattr(args, "stream", False) or getattr(args, "json", False):
         return None
     state = {"wrote": False}
 
@@ -77,13 +77,16 @@ def _delta_printer(args):
             state["wrote"] = True
         sys.stdout.write(piece)
         sys.stdout.flush()
+        on_delta.text += piece
 
+    on_delta.text = ""
     return on_delta
 
 
-def _streaming(args):
-    """是否处于流式模式（仅真实模型支持）。"""
-    return bool(getattr(args, "stream", False)) and getattr(args, "provider", "") == "openai"
+def _already_streamed(result, on_delta):
+    """只省略真正已输出的完整回答；fallback、审批和失败信息必须显示。"""
+    return (result.status == "completed" and bool(result.output)
+            and bool(on_delta) and on_delta.text.endswith(result.output))
 
 
 def _tool_settings_from_env():
@@ -188,17 +191,18 @@ async def dispatch(args):
         agent = Agent(provider, store=store, workspace=args.workspace,
                       config=AgentConfig(max_steps=args.max_steps), on_event=trace if args.verbose else None,
                       tool_settings=_tool_settings_from_env())
+        on_delta = _delta_printer(args)
         if args.command == "run":
-            result = await agent.run(args.prompt, args.session, on_delta=_delta_printer(args))
+            result = await agent.run(args.prompt, args.session, on_delta=on_delta)
         elif args.command == "approve":
             state = store.load_session(args.session)
             if not state:
                 raise SessionError("未找到会话")
             from .types import ToolCall
             approved = [x["id"] for x in state.get("pending", []) if agent.tools.requires_approval(ToolCall.from_dict(x))] if args.all else args.call
-            result = await agent.resume(args.session, approved)
+            result = await agent.resume(args.session, approved, on_delta=on_delta)
         elif args.command == "deny":
-            result = await agent.resume(args.session, [])
+            result = await agent.resume(args.session, [], on_delta=on_delta)
         elif args.command == "recover":
             result = agent.recover(args.session)
         elif args.command == "workflow":
@@ -218,23 +222,24 @@ async def dispatch(args):
                 if not prompt:
                     continue
                 try:
+                    on_delta = _delta_printer(args)
                     if prompt in ("/approve", "/deny"):
                         state = store.load_session(session) if session else None
                         if not state:
                             raise SessionError("当前没有会话")
                         from .types import ToolCall
                         ids = [x["id"] for x in state.get("pending", []) if agent.tools.requires_approval(ToolCall.from_dict(x))] if prompt == "/approve" else []
-                        result = await agent.resume(session, ids)
+                        result = await agent.resume(session, ids, on_delta=on_delta)
                     else:
-                        result = await agent.run(prompt, session, on_delta=_delta_printer(args))
+                        result = await agent.run(prompt, session, on_delta=on_delta)
                     session = result.session_id
-                    show_result(result, args.json, args, streamed=_streaming(args))
+                    show_result(result, args.json, args, streamed=_already_streamed(result, on_delta))
                     if result.status == "waiting_approval":
                         print("在聊天中输入 /approve 批准以上参数，或 /deny 拒绝。")
                 except (SessionError, ValueError) as exc:
                     print(str(exc), file=sys.stderr)
             return 0
-        show_result(result, args.json, args, streamed=_streaming(args))
+        show_result(result, args.json, args, streamed=_already_streamed(result, on_delta))
         return 0 if result.status in ("completed", "waiting_approval") else 1
     finally:
         store.close()
@@ -242,9 +247,6 @@ async def dispatch(args):
 
 def main(argv=None):
     args = parser().parse_args(argv)
-    # 子命令上的 --stream 只覆盖全局值；未提供（None）时沿用全局开关。
-    if getattr(args, "stream", None) is None:
-        args.stream = False
     try:
         if args.command == "serve":
             # HTTP 服务自己管理后台任务，不嵌套在 CLI 的 asyncio 事件循环中。

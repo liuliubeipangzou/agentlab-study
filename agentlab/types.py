@@ -1,6 +1,6 @@
 """所有模块共享的数据结构；不依赖某一家模型 SDK。"""
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol
 import uuid
 
 
@@ -56,4 +56,14 @@ class ModelResponse:
 
 class Provider(Protocol):
     async def complete(self, messages: List[Message], tools: List[dict]) -> ModelResponse:
+        ...
+
+
+class StreamingProvider(Provider, Protocol):
+    """可选扩展：逐片交付正文，工具参数在完整响应中返回，不能提前执行。"""
+
+    supports_tool_streaming: bool
+
+    async def stream(self, messages: List[Message], on_delta: Optional[Callable[[str], Any]],
+                     tools: Optional[List[dict]] = None) -> ModelResponse:
         ...

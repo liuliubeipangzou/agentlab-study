@@ -2,8 +2,8 @@
 "use strict";
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-const state = {csrf: null, config: null, tools: [], view: "chat", inspector: "trace", sessions: [], currentId: null, current: null, cache: new Map(), jobs: new Map(), drafts: new Map(), chatNotice: "", chatEpoch: 0, sending: false, approving: false, cancelling: false, polling: false, online: false, ready: false, lastRefresh: 0, messageStamp: "", inspectorStamp: "", approvalStamp: "", recoveryStamp: "", lesson: "learning-path.md", lessonEpoch: 0, knowledgeEpoch: 0};
-const titles = {chat: "对话工作台", knowledge: "知识库", tools: "工具箱", learning: "学习路径", lab: "协作实验", settings: "设置"};
+const state = {csrf: null, config: null, tools: [], view: "chat", inspector: "trace", sessions: [], currentId: null, current: null, cache: new Map(), jobs: new Map(), drafts: new Map(), chatNotice: "", chatEpoch: 0, sending: false, approving: false, cancelling: false, polling: false, online: false, ready: false, lastRefresh: 0, messageStamp: "", inspectorStamp: "", approvalStamp: "", recoveryStamp: "", files: [], fileStamp: "", lesson: "learning-path.md", lessonEpoch: 0, knowledgeEpoch: 0};
+const titles = {chat: "对话工作台", knowledge: "知识库", files: "工作区文件", tools: "工具箱", learning: "学习路径", lab: "协作实验", settings: "设置"};
 const statuses = {running: "运行中", completed: "已完成", waiting_approval: "等待审批", failed: "运行失败", cancelled: "已停止", limited: "达到限制", pending: "等待开始", success: "已完成", skipped: "已跳过"};
 const lessons = [["learning-path.md", "从零开始", "学习地图与第一个 Agent"], ["architecture.md", "理解执行循环", "消息、模型与工具如何协作"], ["tools.md", "赋予 Agent 能力", "工具协议、权限和安全边界"], ["memory-workflows.md", "记忆与多步协作", "知识检索、会话记忆与 DAG"], ["providers.md", "接入真实模型", "兼容接口、工具调用与重试"], ["operations.md", "让系统稳定运行", "审批、恢复、配置与运维"], ["validation.md", "验证你的 Agent", "回归测试与可复现的检查"]];
 const eventNames = {run_started: "开始处理任务", model_started: "调用模型", model_finished: "模型返回响应", tool_started: "开始执行工具", tool_finished: "工具执行完成", approval_requested: "等待你的批准", approval_resolved: "审批决定已提交", run_completed: "任务已完成", run_failed: "任务运行失败", run_cancelled: "任务已停止", run_limited: "达到运行限制", run_waiting_approval: "已暂停，等待审批"};
@@ -99,6 +99,7 @@ function applyConfig(config) {
   $("#banner-settings").firstChild.textContent = (demo || needsKey) ? "去配置模型" : "模型设置";
   $("#api-key-status").textContent = config.has_api_key ? "本次启动已设置" : "未设置"; $("#settings-saved-status").textContent = "已保存 · " + (demo ? "演示模式" : "真实模型");
   $("#config-provider").value = config.provider || "openai"; $("#config-model").value = config.model || "deepseek-flash"; $("#config-base-url").value = config.base_url || "https://api.deepseek.com";
+  if (config.streaming !== undefined) { const streaming = $("#config-streaming"); if (streaming) streaming.checked = config.streaming !== false; }
   if (config.search_backend !== undefined) $("#config-search-backend").value = config.search_backend || "";
   if (config.has_search_key !== undefined) $("#search-key-status").textContent = config.has_search_key ? "已设置" : "(可选，留空使用免密钥后端)";
   if (needsKey && state.view === "chat") { const keyField = $("#config-api-key"); if (keyField && !keyField.value) keyField.placeholder = "在此粘贴 API Key 后保存"; }
@@ -232,7 +233,7 @@ async function pullJobEvents(job) {
   // 只取游标之后的新事件，避免每次轮询都传输完整事件列表。
   try {
     const payload = await api("/api/jobs/" + encodeURIComponent(job.id) + "/events?since=" + (job.eventCursor || 0));
-    job.eventCursor = payload.total;
+    job.eventCursor = payload.total; if (payload.delta !== undefined) job.delta = payload.delta;
     const fresh = payload.events || [];
     // 运行中的任务直接由任务事件驱动轨迹面板，无需等待会话整体刷新。
     if (fresh.length && state.current && job.sessionId === state.currentId) {
@@ -243,12 +244,13 @@ async function pullJobEvents(job) {
 }
 async function poll() {
   if (!state.ready || state.polling) return; state.polling = true;
-  try { const active = [...state.jobs.values()].filter(job => job.status === "running"); await Promise.all(active.map(async job => { try { const result = await api("/api/jobs/" + encodeURIComponent(job.id)); job.status = result.status; job.result = result.result; job.error = result.error; await pullJobEvents(job); if (result.status !== "running") finishJob(job); } catch (error) { if (error.status === 404) { job.status = "failed"; job.error = "该任务已不在当前服务中，请检查会话是否需要恢复。"; finishJob(job); } } })); if (state.currentId) await refreshCurrent(); if (Date.now() - state.lastRefresh > 5000 || active.some(job => job.status !== "running")) await refreshSessions(); updateJobButtons(); }
+  try { const active = [...state.jobs.values()].filter(job => job.status === "running"); await Promise.all(active.map(async job => { try { const result = await api("/api/jobs/" + encodeURIComponent(job.id)); job.status = result.status; job.result = result.result; job.error = result.error; job.delta = result.delta || ""; await pullJobEvents(job); if (result.status !== "running") finishJob(job); } catch (error) { if (error.status === 404) { job.status = "failed"; job.error = "该任务已不在当前服务中，请检查会话是否需要恢复。"; finishJob(job); } } })); if (state.currentId) await refreshCurrent(); if (Date.now() - state.lastRefresh > 5000 || active.some(job => job.status !== "running")) await refreshSessions(); updateJobButtons(); }
   catch (_) { /* Retry on the next poll; connection state is visible in the sidebar. */ }
-  finally { state.polling = false; }
+  finally { renderStreamPreview(); state.polling = false; }
 }
 function finishJob(job) {
   if (job.notified) return; job.notified = true;
+  job.delta = ""; renderStreamPreview();
   if (job.kind === "run") {
     if (job.sessionId === state.currentId && state.current) { state.current.active = false; state.current.active_job_id = null; state.current.status = job.result && job.result.status || job.status; state.current.output = job.result && job.result.output || job.error || ""; renderChat(); }
     if (job.status === "failed" && job.error) toast(job.error, "error"); if (job.sessionId !== state.currentId && job.result) toast("后台对话" + (statuses[job.result.status] || "已完成") + "，可在最近对话中查看。");
@@ -276,7 +278,65 @@ async function searchKnowledge(event) {
   catch (error) { host.replaceChildren(empty("检索没有完成", error.message)); throw error; }
   finally { busy($("#knowledge-search-button"), false); }
 }
+function renderFiles() {
+  const host = $("#workspace-file-list"); if (!host) return;
+  const stamp = JSON.stringify(state.files); if (stamp === state.fileStamp) return; state.fileStamp = stamp;
+  const count = $("#workspace-file-count"), note = $("#workspace-files-note");
+  if (count) count.textContent = state.files.length ? state.files.length + " 项" : "空";
+  if (!state.files.length) { host.replaceChildren(empty("工作区还是空的", "上传 CSV、JSON 或文本资料，然后在对话中指定文件名。", "file")); if (note) note.textContent = ""; return; }
+  host.replaceChildren(...state.files.map(row => {
+    const item = el("div", "source-item"), top = el("div");
+    top.append(el("strong", "", row.path), el("small", "", row.kind === "directory" ? "目录" : (row.size || 0) + " 字节"));
+    item.append(top);
+    if (row.kind === "file") item.append(button("下载", "text-button", guarded(async () => {
+      const result = await api("/api/files/" + encodeURIComponent(row.path));
+      const binary = atob(result.content_base64), bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+      const url = URL.createObjectURL(new Blob([bytes], {type: result.content_type || "application/octet-stream"}));
+      const link = el("a"); link.href = url; link.download = result.name; link.click(); URL.revokeObjectURL(url);
+    })));
+    item.append(button("用于对话", "text-button", () => useExample("读取工作区文件 " + row.path + " 并据此完成任务")));
+    return item;
+  }));
+  if (note) note.textContent = "每份上传上限 1 MiB，同名文件不会被覆盖。";
+}
+async function refreshFiles() {
+  const result = await api("/api/files"); state.files = result.files || []; renderFiles();
+  const host = $("#workspace-files-note");
+  if (host) host.textContent = result.truncated ? "条目较多，仅显示前 " + state.files.length + " 项。" : "每份上传上限 1 MiB，同名文件不会被覆盖。";
+}
+async function uploadWorkspaceFiles(event) {
+  const input = event.target, files = [...(input.files || [])];
+  if (!files.length) return;
+  const status = $("#workspace-upload-status");
+  if (files.length > 10) { input.value = ""; throw new Error("每次最多上传 10 个文件。"); }
+  if (status) status.textContent = "正在上传 " + files.length + " 个文件…";
+  try {
+    const payload = {files: await Promise.all(files.map(async file => ({name: file.name, content_base64: await toBase64(file)})))};
+    const result = await api("/api/files/import", payload);
+    toast("已上传 " + (result.files || []).length + " 个文件。");
+    if (status) status.textContent = "上传完成。";
+    state.fileStamp = ""; await refreshFiles();
+  } catch (error) { if (status) status.textContent = error.message; throw error; }
+  finally { input.value = ""; }
+}
+function toBase64(file) {
+  return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(",")[1] || ""); reader.onerror = () => reject(new Error("读取文件失败：" + file.name)); reader.readAsDataURL(file); });
+}
+function renderStreamPreview() {
+  const host = $("#stream-preview"); if (!host) return;
+  const job = currentJob(), text = job && job.delta ? job.delta : "";
+  // 只在真正有实时增量时显示，避免与消息列表里的最终回答重复。
+  if (!text) { host.textContent = ""; show(host, false); return; }
+  host.textContent = text; show(host, true);
+}
+function renderToolCount() {
+  const total = state.tools.length;
+  $$("[data-tool-count]").forEach(node => { node.textContent = total + " 个内置工具"; });
+  const nav = $("#tool-count"); if (nav) nav.textContent = total;
+}
 function renderTools() {
+  renderToolCount();
   $("#tool-grid").replaceChildren(...state.tools.map(definition => { const tool = definition.function || definition, info = toolInfo[tool.name] || [tool.name, "tools", "blue", tool.description, ""], write = definition.risk === "write" || ["write_file", "remember"].includes(tool.name), card = el("article", "card tool-definition-card"), top = el("div", "tool-definition-top"), mark = el("span", "example-icon " + info[2]); mark.append(icon(info[1])); top.append(mark, badge(write ? "需要审批" : "可直接执行", write ? "warning" : "success")); card.append(top, el("h3", "", info[0]), el("code", "tool-function-name", tool.name), el("p", "muted", info[3]), details("参数 Schema", tool.parameters, "schema-" + tool.name)); if (info[4]) card.append(button("在工作台试试 →", "text-button", () => useExample(info[4]))); return card; }));
 }
 function renderLessonList() {
@@ -327,13 +387,21 @@ async function saveSettings(event) {
   if (searchBackend) payload.search_backend = searchBackend.value;
   if (searchKey && searchKey.value.trim()) payload.search_api_key = searchKey.value.trim();
   if (searxUrl) payload.searx_url = searxUrl.value.trim();
+  const streaming = $("#config-streaming"); if (streaming) payload.streaming = streaming.checked;
+  const clearKey = $("#clear-api-key"); if (clearKey && clearKey.checked) payload.api_key = "";
+  const clearSearchKey = $("#clear-search-key"); if (clearSearchKey && clearSearchKey.checked) payload.search_api_key = "";
   busy($("#save-settings"), true);
   try {
     const result = await api("/api/config", payload); applyConfig(result.config); show($("#connection-result"), false);
     toast(result.config.has_api_key ? "配置已保存。" : "已保存，但还没有 API Key：填写后才能真正调用模型。",
           result.config.has_api_key ? "success" : "error");
   }
-  finally { key.value = ""; if (searchKey) searchKey.value = ""; delete payload.api_key; delete payload.search_api_key; busy($("#save-settings"), false); }
+  finally {
+    key.value = ""; if (searchKey) searchKey.value = "";
+    const clearKey = $("#clear-api-key"); if (clearKey) clearKey.checked = false;
+    const clearSearchKey = $("#clear-search-key"); if (clearSearchKey) clearSearchKey.checked = false;
+    delete payload.api_key; delete payload.search_api_key; busy($("#save-settings"), false);
+  }
 }
 async function testConnection() {
   busy($("#test-connection"), true); const host = $("#connection-result"); host.className = "connection-result"; host.textContent = "正在测试已保存的模型连接…";
@@ -344,13 +412,14 @@ async function testConnection() {
 function useExample(prompt) { navigate("chat"); if (running() || pending() || recovery()) { toast("请先完成当前会话的运行或审批，也可以新建对话。", "error"); return; } $("#prompt").value = prompt; saveDraft(); renderChat(); $("#prompt").focus(); }
 async function bootstrap() {
   busy($("#retry-bootstrap"), true);
-  try { const result = await api("/api/bootstrap"); state.csrf = result.csrf_token; state.tools = result.tools || []; state.ready = true; applyConfig(result.config); renderTools(); renderLessonList(); if (result.stats) $("#knowledge-count").textContent = result.stats.documents || 0; show($("#boot-error"), false); if (result.warning) { toast(result.warning, "error"); $("#settings-saved-status").textContent = "配置需修复"; } await refreshSessions(); renderChat(); renderInspector(); if (state.view === "knowledge") await refreshKnowledge(); if (state.view === "learning") loadLesson(state.lesson); }
+  try { const result = await api("/api/bootstrap"); state.csrf = result.csrf_token; state.tools = result.tools || []; state.ready = true; applyConfig(result.config); renderTools(); renderLessonList(); if (result.stats) $("#knowledge-count").textContent = result.stats.documents || 0; show($("#boot-error"), false); if (result.warning) { toast(result.warning, "error"); $("#settings-saved-status").textContent = "配置需修复"; } await refreshSessions(); renderChat(); renderInspector(); if (state.view === "knowledge") await refreshKnowledge();
+  if (state.view === "files") await refreshFiles(); if (state.view === "learning") loadLesson(state.lesson); }
   catch (error) { state.ready = false; $("#boot-error-message").textContent = error.message; show($("#boot-error"), true); renderChat(); }
   finally { busy($("#retry-bootstrap"), false); }
 }
 
 // Install listeners once: polling never replaces the textarea or settings inputs.
-$$("[data-nav]").forEach(element => element.addEventListener("click", () => navigate(element.dataset.nav)));
+$$("[data-nav]").forEach(element => element.addEventListener("click", () => { navigate(element.dataset.nav); if (element.dataset.nav === "files") guarded(refreshFiles)(); }));
 $$("[data-prompt]").forEach(element => element.addEventListener("click", () => useExample(element.dataset.prompt)));
 $$("[data-doc]").forEach(element => element.addEventListener("click", () => { navigate("learning"); loadLesson(element.dataset.doc); }));
 $("#new-chat").addEventListener("click", newSession);
@@ -359,6 +428,8 @@ $("#banner-settings").addEventListener("click", () => navigate("settings"));
 $("#toggle-sidebar").addEventListener("click", () => document.body.classList.toggle("sidebar-open"));
 $("#refresh-sessions").addEventListener("click", guarded(refreshSessions));
 $("#refresh-knowledge").addEventListener("click", guarded(refreshKnowledge));
+$("#refresh-files").addEventListener("click", guarded(refreshFiles));
+$("#workspace-upload").addEventListener("change", guarded(uploadWorkspaceFiles));
 $("#retry-bootstrap").addEventListener("click", bootstrap);
 $("#chat-form").addEventListener("submit", guarded(async event => { event.preventDefault(); await sendPrompt(); }));
 $("#prompt").addEventListener("input", () => { saveDraft(); $("#send-message").disabled = !state.ready || running() || pending() || recovery() || !$("#prompt").value.trim(); });

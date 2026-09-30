@@ -7,7 +7,7 @@
 - 工作目录固定为一个工作区内的临时目录，结束后删除；
 - 内存与 CPU 使用 `resource.setrlimit` 硬限制（RLIMIT_CPU 在 macOS/Linux 上可靠触发）；
 - 环境变量只保留最小集合，密钥不会进入子进程；
-- 结果通过专用文件描述符回传，业务 stdout 被重定向后一并捕获。
+- 结果通过专用文件描述符回传，stdout/stderr 并发有界捕获。
 
 **明确的边界**：子进程仍以当前用户身份运行，拥有完整文件系统与网络访问权限。
 本模块不提供操作系统级隔离（如需请自行接入容器或 seccomp）。它是"把代码跑起来"
@@ -35,14 +35,13 @@ MAX_OUTPUT_CHARS = 20_000
 # 子进程只允许看到这些环境变量；密钥与代理配置一律不传递。
 _ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "HOME", "SYSTEMROOT")
 
-# 引导程序：把业务 stdout/stderr 重定向到缓冲区，再用专用 fd 回传结构化结果，
-# 这样即使业务代码打印大量内容也不会污染协议通道。
+# 引导程序：业务 stdout/stderr 保留独立管道，结果由专用 fd 回传。
 _RUNNER = r'''
-import contextlib, io, json, os, resource, sys, traceback
+import json, os, resource, sys, traceback
 _payload = json.loads(sys.stdin.read())
 _fd = int(_payload["result_fd"])
 _code = _payload["code"]
-_stdout, _stderr = io.StringIO(), io.StringIO()
+_output_limit = int(_payload["max_output_chars"])
 
 # 第一道防线（子进程自保）：在 exec 之前由父进程设置的限制在部分平台上会被继承
 # 但不可靠，故子进程自行再设一次。RLIMIT_AS 在 Linux 有效、macOS 上多半被忽略，
@@ -62,18 +61,30 @@ if _cpu > 0 and hasattr(resource, "RLIMIT_CPU"):
     except (ValueError, OSError):
         pass
 
+if hasattr(resource, "RLIMIT_FSIZE"):
+    resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
 _ok, _value = True, None
 try:
-    with contextlib.redirect_stdout(_stdout), contextlib.redirect_stderr(_stderr):
-        _ns = {"__name__": "__main__", "__doc__": None}
-        exec(compile(_code, "<agent_python>", "exec"), _ns)
-        _value = _ns.get("result")
+    _ns = {"__name__": "__main__", "__doc__": None}
+    exec(compile(_code, "<agent_python>", "exec"), _ns)
+    _value = _ns.get("result")
 except BaseException:
     _ok = False
     _value = traceback.format_exc(limit=8)
-_result = {"ok": _ok, "result": _value, "stdout": _stdout.getvalue(), "stderr": _stderr.getvalue()}
+try:
+    _encoded = json.dumps(_value, ensure_ascii=False, default=repr)
+except (TypeError, ValueError, RecursionError):
+    _encoded = json.dumps(repr(_value), ensure_ascii=False)
+_truncated = len(_encoded) > _output_limit
+if _truncated:
+    _value = {"truncated": True, "preview": _encoded[:_output_limit],
+              "original_chars": len(_encoded)}
+else:
+    _value = json.loads(_encoded)
+_result = {"ok": _ok, "result": _value, "truncated": _truncated}
 with os.fdopen(_fd, "w", encoding="utf-8") as _stream:
     json.dump(_result, _stream, ensure_ascii=False, default=repr)
+
 '''
 
 
@@ -100,23 +111,6 @@ def _safe_value(value, depth=0):
         return value
     except (TypeError, ValueError):
         return repr(value)[:2000]
-
-
-def _limits(memory_mb, cpu_seconds):
-    """在 fork 之后、exec 之前设置的限制集合。
-
-    内存与 CPU 限制已经由子进程在 `_RUNNER` 内自行设置（更可靠且不依赖 fork
-    后的 Python 状态），这里只保留文件大小限制，避免子进程写满磁盘。
-    """
-    def apply():
-        import resource
-        if hasattr(resource, "RLIMIT_FSIZE"):
-            try:
-                resource.setrlimit(resource.RLIMIT_FSIZE, (64 * 1024 * 1024, 64 * 1024 * 1024))
-            except (ValueError, OSError):
-                pass
-
-    return apply
 
 
 def _child_environment():
@@ -198,22 +192,6 @@ def _rss_procfs(pid):
     return None
 
 
-def _children_peak_bytes():
-    """已结束子进程的历史峰值（macOS 为字节，Linux 为 KiB）。
-
-    仅在父进程侧无法实时读取 RSS 时作为兜底：它无法阻止超限，但能在事后
-    判断"超限"而不是把结果误报为成功。
-    """
-    try:
-        import resource
-        raw = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-    except Exception:
-        return None
-    if raw is None:
-        return None
-    return raw if sys.platform == "darwin" else raw * 1024
-
-
 async def _memory_watchdog(process, limit_bytes, interval=0.15):
     """轮询子进程 RSS，超限则终止整个进程组。
 
@@ -239,13 +217,35 @@ async def _memory_watchdog(process, limit_bytes, interval=0.15):
     return False if inspected else None
 
 
+async def _capture_stream(stream, limit):
+    """持续排空管道，但只保存有界前缀，防止管道写满和父进程内存增长。"""
+    chunks, kept, total = [], 0, 0
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if kept < limit:
+            prefix = chunk[:limit - kept]
+            chunks.append(prefix)
+            kept += len(prefix)
+    return b"".join(chunks), total > kept
+
+
+async def _wait_and_clean_group(process):
+    # asyncio Process.wait 可能等待被孙进程继承的 stdout EOF；先观察 leader 的退出。
+    while process.returncode is None:
+        await asyncio.sleep(0.02)
+    _kill_group(process)
+    return await process.wait()
+
+
 async def run_python(code, timeout=DEFAULT_TIMEOUT, memory_mb=DEFAULT_MEMORY_MB,
                      cwd=None, max_output_chars=MAX_OUTPUT_CHARS):
-    """执行一段 Python 代码，返回结构化结果。
+    """执行当前用户批准的代码，返回结果、stdout/stderr 与资源限制诊断。
 
-    代码可通过定义名为 `result` 的变量来返回数据。返回 dict：
-    `ok` / `result` / `stdout` / `stderr` / `duration` / `exit_code` /
-    `timed_out` / `truncated`。
+    三条输出管道并发排空并分别限额；每条退出路径都清理原进程组。子进程主动
+    setsid 后脱离进程组不在本工具隔离保证内，需要容器级管理才能可靠限制。
     """
     if not isinstance(code, str) or not code.strip():
         raise ValueError("code 不能为空")
@@ -255,154 +255,120 @@ async def run_python(code, timeout=DEFAULT_TIMEOUT, memory_mb=DEFAULT_MEMORY_MB,
         raise ValueError("timeout 必须是不超过 %s 的正数" % MAX_TIMEOUT)
     if type(memory_mb) is not int or not 64 <= memory_mb <= MAX_MEMORY_MB:
         raise ValueError("memory_mb 必须在 64 到 %d 之间" % MAX_MEMORY_MB)
-    if type(max_output_chars) is not int or max_output_chars < 128:
-        raise ValueError("max_output_chars 必须是 >= 128 的整数")
-
-    workdir = None
-    temporary = False
-    if cwd is None:
-        # 默认给一个工作区内的临时目录，退出后删除，避免污染项目目录。
-        workdir = tempfile.mkdtemp(prefix="agentlab-py-")
-        temporary = True
-    else:
-        workdir = str(Path(cwd).expanduser().resolve())
-        Path(workdir).mkdir(parents=True, exist_ok=True)
-
+    if type(max_output_chars) is not int or not 128 <= max_output_chars <= 100000:
+        raise ValueError("max_output_chars 必须在 128 到 100000 之间")
+    if os.name != "posix":
+        raise RuntimeError("当前代码执行器需要 POSIX 进程组和资源限制支持")
+    temporary = cwd is None
+    workdir = tempfile.mkdtemp(prefix="agentlab-py-") if temporary else str(Path(cwd).expanduser().resolve())
+    Path(workdir).mkdir(parents=True, exist_ok=True)
     read_fd, write_fd = os.pipe()
-    cpu_seconds = max(1, int(math.ceil(timeout)))
     payload = json.dumps({"code": code, "result_fd": write_fd,
-                          "memory_mb": memory_mb, "cpu_seconds": cpu_seconds})
-    started = asyncio.get_event_loop().time()
-    process = None
+                          "memory_mb": memory_mb, "cpu_seconds": max(1, int(math.ceil(timeout))),
+                          "max_output_chars": max_output_chars})
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    process, transport, watchdog, completion = None, None, None, None
+    tasks = []
     try:
+        reader = asyncio.StreamReader(limit=65536)
+        protocol = asyncio.StreamReaderProtocol(reader)
+        pipe = os.fdopen(read_fd, "rb", buffering=0)
+        read_fd = None
+        try:
+            transport, _ = await loop.connect_read_pipe(lambda: protocol, pipe)
+        except BaseException:
+            pipe.close()
+            raise
         process = await asyncio.create_subprocess_exec(
-            sys.executable, "-I", "-B", "-c", _RUNNER,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=workdir,
-            env=_child_environment(),
-            pass_fds=(write_fd,),
-            start_new_session=True,          # 独立进程组，便于整组终止
-            preexec_fn=_limits(memory_mb, cpu_seconds),
-        )
+            sys.executable, "-I", "-B", "-u", "-c", _RUNNER,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, cwd=workdir, env=_child_environment(),
+            pass_fds=(write_fd,), start_new_session=True)
         os.close(write_fd)
         write_fd = None
-        watchdog = asyncio.ensure_future(
-            _memory_watchdog(process, memory_mb * 1024 * 1024))
-        killed_for_memory = False
-        memory_inspected = True
+        watchdog = asyncio.create_task(_memory_watchdog(process, memory_mb * 1024 * 1024))
+        tasks = [asyncio.create_task(_capture_stream(process.stdout, max_output_chars * 4)),
+                 asyncio.create_task(_capture_stream(process.stderr, max_output_chars * 4)),
+                 asyncio.create_task(_capture_stream(reader, max_output_chars * 24 + 4096)),
+                 asyncio.create_task(_wait_and_clean_group(process))]
+        completion = asyncio.gather(*tasks)
+        process.stdin.write(payload.encode("utf-8"))
+        await process.stdin.drain()
+        process.stdin.close()
+        timed_out = False
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(payload.encode("utf-8")), timeout=timeout)
-            timed_out = False
+            captured = await asyncio.wait_for(asyncio.shield(completion), timeout=timeout)
         except asyncio.TimeoutError:
             timed_out = True
-            # 终止前先尽力排空管道，保住超时前已产生的输出，便于排查。
             _kill_group(process)
-            try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=5)
-            except (asyncio.TimeoutError, Exception):
-                stdout, stderr = b"", b""
+            captured = await asyncio.wait_for(asyncio.shield(completion), timeout=5)
         if not watchdog.done():
             watchdog.cancel()
-        try:
-            outcome = await asyncio.wait_for(watchdog, timeout=1)
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-            outcome = False
-        if outcome is True:
-            killed_for_memory = True
-            timed_out = False
-            try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=3)
-            except Exception:
-                pass
-        elif outcome is None:
-            memory_inspected = False
-
-        duration = round(asyncio.get_event_loop().time() - started, 3)
-        with os.fdopen(read_fd, "r", encoding="utf-8", errors="replace") as stream:
-            read_fd = None
-            raw_result = stream.read(MAX_OUTPUT_CHARS * 8)
-        decoded = None
-        if raw_result.strip():
-            try:
-                decoded = json.loads(raw_result)
-            except ValueError:
-                decoded = None
-
-        # 兜底：若父进程无法实时读取 RSS，用子进程历史峰值事后判断是否超限，
-        # 避免把"内存超限"误报为成功。
-        if not killed_for_memory and not memory_inspected:
-            peak = _children_peak_bytes()
-            if peak is not None and peak > memory_mb * 1024 * 1024:
-                return {"ok": False, "timed_out": False, "exit_code": process.returncode,
-                        "error": "代码内存占用峰值约 %d MiB，超过 %d MiB 上限"
-                                 % (peak // (1024 * 1024), memory_mb),
-                        "stdout": _clip(stdout.decode("utf-8", "replace"), max_output_chars),
-                        "stderr": _clip(stderr.decode("utf-8", "replace"), max_output_chars),
-                        "duration": duration, "truncated": False,
-                        "limit_exceeded": "memory", "memory_enforced": False}
-
-        if killed_for_memory:
-            return {"ok": False, "timed_out": False, "exit_code": process.returncode,
-                    "error": "代码内存占用超过 %d MiB 上限，已终止进程组" % memory_mb,
-                    "stdout": _clip(stdout.decode("utf-8", "replace"), max_output_chars),
-                    "stderr": _clip(stderr.decode("utf-8", "replace"), max_output_chars),
-                    "duration": duration, "truncated": False,
-                    "limit_exceeded": "memory", "memory_enforced": True}
-
-        if timed_out:
-            return {"ok": False, "timed_out": True, "exit_code": process.returncode,
-                    "error": "代码执行超过 %.1f 秒，已终止进程组" % timeout,
-                    "stdout": _clip(stdout.decode("utf-8", "replace"), max_output_chars),
-                    "stderr": _clip(stderr.decode("utf-8", "replace"), max_output_chars),
-                    "duration": duration, "truncated": False}
-
+        outcome = (await asyncio.gather(watchdog, return_exceptions=True))[0]
+        killed_for_memory = outcome is True
+        (stdout, stdout_cut), (stderr, stderr_cut), (raw, raw_cut), exit_code = captured
         out = _clip(stdout.decode("utf-8", "replace"), max_output_chars)
         err = _clip(stderr.decode("utf-8", "replace"), max_output_chars)
-        if decoded is None:
-            if process.returncode != 0:
-                hint = "（常见原因：内存超限、CPU 超时，或被信号终止）"
-                return {"ok": False, "exit_code": process.returncode,
-                        "error": "子进程异常退出，返回码 %s%s" % (process.returncode, hint),
-                        "stdout": out, "stderr": err, "duration": duration,
-                        "timed_out": False, "truncated": False}
-            return {"ok": False, "exit_code": process.returncode,
-                    "error": "子进程没有回传结构化结果", "stdout": out, "stderr": err,
-                    "duration": duration, "timed_out": False, "truncated": False}
-
-        if not decoded.get("ok"):
-            return {"ok": False, "exit_code": process.returncode,
-                    "error": _clip(str(decoded.get("result", "")), max_output_chars),
-                    "stdout": _clip(decoded.get("stdout", ""), max_output_chars) or out,
-                    "stderr": _clip(decoded.get("stderr", ""), max_output_chars) or err,
-                    "duration": duration, "timed_out": False, "truncated": False}
-
+        result = {"ok": False, "stdout": out, "stderr": err,
+                  "exit_code": exit_code, "duration": round(loop.time() - started, 3),
+                  "timed_out": timed_out and not killed_for_memory,
+                  "truncated": stdout_cut or stderr_cut or len(stdout.decode("utf-8", "replace")) > max_output_chars
+                               or len(stderr.decode("utf-8", "replace")) > max_output_chars,
+                  "memory_enforced": outcome in (True, False) and not isinstance(outcome, BaseException)}
+        if killed_for_memory:
+            result.update(error="代码内存占用超过 %d MiB 上限，已终止进程组" % memory_mb,
+                          limit_exceeded="memory")
+            return result
+        if timed_out:
+            result["error"] = "代码执行超过 %.1f 秒，已终止进程组" % timeout
+            return result
+        try:
+            decoded = json.loads(raw) if not raw_cut else None
+        except (ValueError, RecursionError):
+            decoded = None
+        if not isinstance(decoded, dict) or type(decoded.get("ok")) is not bool:
+            result["error"] = "子进程异常退出，返回码 %s；未收到完整结构化结果" % exit_code
+            return result
+        if not decoded["ok"]:
+            result["error"] = _clip(str(decoded.get("result", "代码执行失败")), max_output_chars)
+            if "MemoryError" in result["error"]:
+                result.update(limit_exceeded="memory", error="内存限制触发：" + result["error"])
+            return result
+        if exit_code != 0:
+            result["error"] = "子进程异常退出，返回码 %s" % exit_code
+            return result
         value = _safe_value(decoded.get("result"))
-        rendered = json.dumps(value, ensure_ascii=False, default=repr)
-        truncated = len(rendered) > max_output_chars
-        if truncated:
-            value = {"truncated": True, "preview": rendered[:max_output_chars],
-                     "original_chars": len(rendered)}
-        return {"ok": True, "result": value, "stdout": _clip(decoded.get("stdout", ""), max_output_chars),
-                "stderr": _clip(decoded.get("stderr", ""), max_output_chars),
-                "exit_code": process.returncode, "duration": duration,
-                "timed_out": False, "truncated": truncated}
+        result.update(ok=True, result=value, truncated=result["truncated"] or bool(decoded.get("truncated")))
+        return result
     finally:
+        if process is not None:
+            _kill_group(process)
+        if watchdog is not None and not watchdog.done():
+            watchdog.cancel()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if watchdog is not None:
+            await asyncio.gather(watchdog, return_exceptions=True)
+        if completion is not None:
+            await asyncio.gather(completion, return_exceptions=True)
+        if process is not None:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except (Exception, asyncio.CancelledError):
+                pass
+        if transport is not None:
+            transport.close()
         for descriptor in (write_fd, read_fd):
             if descriptor is not None:
                 try:
                     os.close(descriptor)
                 except OSError:
                     pass
-        if process is not None and process.returncode is None:
-            _kill_group(process)
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except Exception:
-                pass
-        if temporary and workdir:
+        if temporary:
             shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -415,7 +381,7 @@ def _clip(text, limit):
 def _kill_group(process):
     """终止整个进程组；失败时退化为终止单个进程。"""
     try:
-        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         try:
             process.kill()

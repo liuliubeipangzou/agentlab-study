@@ -238,29 +238,65 @@ if __name__ == "__main__":
 
 
 class FakeStreamResponse:
-    """模拟 http.client 的行迭代接口：产出 bytes 行，并支持上下文管理器。"""
+    """模拟真实 HTTPResponse 的流式读取协议。
+
+    生产代码用 `readline(size)` 读取（而非迭代），这样取消时可以关闭底层 socket
+    唤醒阻塞中的读取。fixture 必须实现同一协议，否则测到的是假象。
+    """
 
     def __init__(self, text):
-        self._lines = [(line + "\n").encode("utf-8") for line in text.split("\n")]
+        self._data = (text + "\0").encode("utf-8")
+        self._position = 0
+        self.closed = False
 
     def __enter__(self):
         return self
 
     def __exit__(self, *arguments):
+        self.close()
         return False
 
+    def readline(self, size=-1):
+        if self._position >= len(self._data):
+            return b""
+        end = self._data.find(b"\n", self._position)
+        end = len(self._data) if end < 0 else end + 1
+        if isinstance(size, int) and size > 0:
+            end = min(end, self._position + size)
+        chunk = self._data[self._position:end]
+        self._position = end
+        return chunk
+
+    def close(self):
+        self.closed = True
+
+    # 兼容仍需迭代的读取路径。
     def __iter__(self):
-        return iter(self._lines)
+        while True:
+            line = self.readline()
+            if not line:
+                return
+            yield line
 
 
-def sse(*events):
-    """把若干字典或原始字符串拼成 SSE 文本。"""
+def sse(*events, usage=None, terminate=True):
+    """把若干字典或原始字符串拼成 SSE 文本。
+
+    默认补上 usage 帧与 `[DONE]`：生产代码请求了 include_usage，并在缺少用量时
+    判定为不完整流。
+    """
     parts = []
     for event in events:
         if isinstance(event, str):
             parts.append(event)
         else:
             parts.append("data: " + json.dumps(event, ensure_ascii=False))
+    if usage is None:
+        usage = {"prompt_tokens": 3, "completion_tokens": 2}
+    if usage is not False:
+        parts.append("data: " + json.dumps({"choices": [], "usage": usage}, ensure_ascii=False))
+    if terminate:
+        parts.append("data: [DONE]")
     return "\n\n".join(parts) + "\n\n"
 
 
@@ -268,8 +304,27 @@ def delta(content, finish=None):
     return {"choices": [{"delta": {"content": content}, "finish_reason": finish}]}
 
 
+def tool_fragment(index, identifier=None, name=None, arguments=None, finish=None):
+    """构造一个工具调用增量片段；字段省略即表示该片段不携带该字段。"""
+    fragment = {"index": index}
+    if identifier is not None:
+        fragment["id"] = identifier
+    function = {}
+    if name is not None:
+        function["name"] = name
+    if arguments is not None:
+        function["arguments"] = arguments
+    if function:
+        fragment["function"] = function
+    return {"choices": [{"delta": {"tool_calls": [fragment]}, "finish_reason": finish}]}
+
+
 class StreamingTests(unittest.IsolatedAsyncioTestCase):
-    """流式解析：只用于无工具回合，且必须容忍分片与注释。"""
+    """流式解析：必须容忍注释、分片与工具调用增量。
+
+    服务端要求 `stream_options.include_usage`，因此 fixture 必须带 usage 帧，
+    否则会被判为不完整流。
+    """
 
     def setUp(self):
         self.provider = OpenAICompatibleProvider("test-model", "sk-unit-test-placeholder",
@@ -328,12 +383,16 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ProviderError):
                 await self.provider.stream([Message("user", "hi")], None)
 
-    async def test_missing_usage_defaults_to_zero(self):
-        context, _ = self.stream_with(sse(delta("hi", "stop")))
+    async def test_missing_usage_is_rejected(self):
+        """请求了 include_usage 却拿不到用量，说明流不完整。
+
+        这里刻意报错而不是把用量记为 0：静默记 0 会让上层预算统计与实际计费脱节。
+        """
+        context, _ = self.stream_with(sse(delta("hi", "stop"), usage=False))
         with context:
-            response = await self.provider.stream([Message("user", "hi")], None)
-        self.assertEqual(response.usage.total_tokens, 0)
-        self.assertEqual(response.content, "hi")
+            with self.assertRaises(ProviderError) as raised:
+                await self.provider.stream([Message("user", "hi")], None)
+        self.assertIn("用量", str(raised.exception))
 
     async def test_missing_callback_is_allowed(self):
         context, _ = self.stream_with(sse(delta("ok", "stop")))
@@ -358,3 +417,103 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
                 await self.provider.stream([Message("user", "hi")], None)
         self.assertEqual(opener.open.call_count, 1)
         self.assertNotIn("secret-key-server", str(raised.exception))
+
+
+class StreamingToolCallTests(unittest.IsolatedAsyncioTestCase):
+    """流式工具调用：分片参数必须被完整重组，且不能在流结束前执行。
+
+    工具参数以增量片段到达（`{"que` + `ry": "x"}`），必须按 index 对齐拼接后
+    再交给上层；截断或编号不连续都要拒绝。
+    """
+
+    def setUp(self):
+        self.provider = OpenAICompatibleProvider("test-model", "sk-unit-test-placeholder",
+                                                 base_url="https://api.example.test/v1")
+        self.tools = [
+            {"type": "function", "function": {"name": "calculator",
+                                              "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "web_search",
+                                              "parameters": {"type": "object"}}},
+        ]
+
+    def stream_with(self, text):
+        opener = MagicMock()
+        opener.open.return_value = FakeStreamResponse(text)
+        return patch("agentlab.providers.urllib.request.build_opener", return_value=opener), opener
+
+    async def test_single_tool_call_fragments_are_joined(self):
+        text = sse(tool_fragment(0, identifier="call_1", name="web_search", arguments='{"que'),
+                   tool_fragment(0, arguments='ry": "BM25"}'),
+                   tool_fragment(0, finish="tool_calls"))
+        context, _ = self.stream_with(text)
+        with context:
+            response = await self.provider.stream([Message("user", "hi")], None, tools=self.tools)
+        self.assertEqual(len(response.tool_calls), 1)
+        call = response.tool_calls[0]
+        self.assertEqual(call.name, "web_search")
+        self.assertEqual(call.id, "call_1")
+        self.assertEqual(call.arguments, {"query": "BM25"})
+
+    async def test_interleaved_tool_calls_are_kept_separate(self):
+        text = sse(tool_fragment(0, identifier="call_a", name="calculator", arguments='{"expression":'),
+                   tool_fragment(1, identifier="call_b", name="web_search", arguments='{"query":'),
+                   tool_fragment(0, arguments='"1+1"}'),
+                   tool_fragment(1, arguments='"x"}'),
+                   tool_fragment(0, finish="tool_calls"))
+        context, _ = self.stream_with(text)
+        with context:
+            response = await self.provider.stream([Message("user", "hi")], None, tools=self.tools)
+        by_name = {call.name: call for call in response.tool_calls}
+        self.assertEqual(set(by_name), {"calculator", "web_search"})
+        self.assertEqual(by_name["calculator"].arguments, {"expression": "1+1"})
+        self.assertEqual(by_name["web_search"].arguments, {"query": "x"})
+
+    async def test_tools_are_sent_and_include_usage_requested(self):
+        text = sse(tool_fragment(0, identifier="c1", name="calculator", arguments="{}", finish="tool_calls"))
+        context, opener = self.stream_with(text)
+        with context:
+            await self.provider.stream([Message("user", "hi")], None, tools=self.tools)
+        payload = json.loads(opener.open.call_args.args[0].data.decode("utf-8"))
+        self.assertTrue(payload["stream"])
+        self.assertEqual(payload["stream_options"], {"include_usage": True})
+        names = [t["function"]["name"] for t in payload.get("tools", [])]
+        self.assertEqual(names, ["calculator", "web_search"])
+
+    async def test_finish_reason_must_match_tool_calls(self):
+        """声明 tool_calls 却没有片段（或反之）属于协议不一致。"""
+        text = sse(tool_fragment(0, finish="tool_calls"))
+        context, _ = self.stream_with(text)
+        with context:
+            with self.assertRaises(ProviderError):
+                await self.provider.stream([Message("user", "hi")], None, tools=self.tools)
+
+    async def test_non_contiguous_tool_index_is_rejected(self):
+        text = sse(tool_fragment(0, identifier="a", name="calculator", arguments="{}"),
+                   tool_fragment(2, identifier="b", name="web_search", arguments="{}"),
+                   tool_fragment(0, finish="tool_calls"))
+        context, _ = self.stream_with(text)
+        with context:
+            with self.assertRaises(ProviderError):
+                await self.provider.stream([Message("user", "hi")], None, tools=self.tools)
+
+    async def test_incomplete_stream_without_finish_is_rejected(self):
+        """没有 finish_reason 就结束的流不能当作完整响应。"""
+        text = sse(tool_fragment(0, identifier="a", name="calculator", arguments="{}"),
+                   terminate=True)
+        context, _ = self.stream_with(text)
+        with context:
+            with self.assertRaises(ProviderError):
+                await self.provider.stream([Message("user", "hi")], None, tools=self.tools)
+
+    async def test_reader_failure_reports_exception_type(self):
+        """底层异常必须保留类型名，否则无从诊断（曾经只报"读取失败"）。"""
+        class BrokenResponse(FakeStreamResponse):
+            def readline(self, size=-1):
+                raise AttributeError("readline is not available")
+
+        opener = MagicMock()
+        opener.open.return_value = BrokenResponse("")
+        with patch("agentlab.providers.urllib.request.build_opener", return_value=opener):
+            with self.assertRaises(ProviderError) as raised:
+                await self.provider.stream([Message("user", "hi")], None)
+        self.assertIn("AttributeError", str(raised.exception))

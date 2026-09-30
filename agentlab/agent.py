@@ -83,16 +83,41 @@ class Agent:
 
     def _identity(self):
         """审批与工作目录、模型端点、工具声明绑定，重启后不能悄悄更换执行环境。"""
+        tools = []
+        for definition in sorted(self.tools.definitions(), key=lambda item: item["function"]["name"]):
+            tool = self.tools.get(definition["function"]["name"])
+            identity = {"definition": definition, "risk": tool.risk}
+            policy = getattr(tool, "approval_policy", None)
+            if policy is not None:
+                identity["approval_policy"] = policy
+            tools.append(identity)
         return {"workspace": str(self.workspace),
                 "provider": {"class": type(self.provider).__module__ + "." + type(self.provider).__qualname__,
                              "model": getattr(self.provider, "model", None),
                              "base_url": getattr(self.provider, "base_url", None)},
-                "tools": [{"definition": definition, "risk": self.tools.get(definition["function"]["name"]).risk}
-                          for definition in sorted(self.tools.definitions(), key=lambda item: item["function"]["name"])]}
+                "tools": tools}
 
     def _check_identity(self, state):
-        if state.get("execution") != self._identity():
-            raise SessionError("执行环境与检查点不一致；请使用原 provider、workspace 和工具注册表恢复会话")
+        current = self._identity()
+        recorded = state.get("execution")
+        if recorded == current:
+            return
+        # 逐项比较并给出可操作的差异说明。只报"不一致"会让用户无从下手，
+        # 尤其是升级导致工具指纹格式变化、使旧检查点失效的情况。
+        if isinstance(recorded, dict) and recorded.get("workspace") != current["workspace"]:
+            raise SessionError(
+                "工作目录与检查点不一致：检查点记录 %s，当前 %s。请使用 --workspace 指向原目录。"
+                % (recorded.get("workspace"), current["workspace"]))
+        if isinstance(recorded, dict) and recorded.get("provider") != current["provider"]:
+            raise SessionError(
+                "模型端点与检查点不一致（检查点 %s，当前 %s）。请用原来的 provider、模型名与 base_url 恢复。"
+                % (recorded.get("provider"), current["provider"]))
+        if isinstance(recorded, dict) and recorded.get("tools") != current["tools"]:
+            raise SessionError(
+                "工具集与检查点不一致（工具定义、风险级别或审批策略已变化）。"
+                "这通常发生在升级或改动工具注册表之后：旧检查点的待审批操作无法复用，"
+                "请执行 recover 结束该轮，然后重新发起任务。")
+        raise SessionError("执行环境与检查点不一致；请使用原 provider、workspace 和工具注册表恢复会话")
 
     def _save(self, state):
         self.store.save_session(state["session_id"], state)
@@ -167,7 +192,8 @@ class Agent:
         finally:
             self.store.release_session(session_id, owner)
 
-    async def resume(self, session_id: str, approved_call_ids=None) -> AgentResult:
+    async def resume(self, session_id: str, approved_call_ids=None,
+                     on_delta: Optional[Callable] = None) -> AgentResult:
         """只批准明确传入的调用 ID，其他待审批调用将收到拒绝结果。"""
         owner = uuid.uuid4().hex
         if not self.store.acquire_session(session_id, owner, ttl=self.config.run_timeout + 60):
@@ -185,7 +211,7 @@ class Agent:
             state["status"] = "running"
             self._save(state)
             self._emit(state, "approval_resolved", approved=list(approved), denied=sorted(pending_ids - approved))
-            return await self._guarded_loop(state)
+            return await self._guarded_loop(state, on_delta)
         finally:
             self.store.release_session(session_id, owner)
 
@@ -205,19 +231,15 @@ class Agent:
             self.store.release_session(session_id, owner)
 
     async def _complete(self, messages, on_delta=None):
-        """获取一次模型响应；在可能时使用流式以获得即时反馈。
-
-        流式仅在两种条件下启用：
-        1. 调用方提供了 `on_delta`（否则流式没有意义）；
-        2. Provider 实现了 `stream`。
-        带工具的回合仍走 `complete()`：在流里重组 tool_calls 的分片参数收益低、
-        正确性风险高，而工具回合的文字通常很短。
-        """
+        """按 Provider 能力选择实时响应，保留旧双参数 stream 和 complete 协议。"""
         definitions = self.tools.definitions()
-        if on_delta is not None and not definitions:
+        if on_delta is not None:
             method = getattr(self.provider, "stream", None)
             if method is not None and callable(method):
-                return await method(messages, on_delta)
+                if getattr(self.provider, "supports_tool_streaming", False) is True:
+                    return await method(messages, on_delta, tools=definitions)
+                if not definitions:
+                    return await method(messages, on_delta)
         return await self.provider.complete(messages, definitions)
 
     async def _guarded_loop(self, state, on_delta=None):

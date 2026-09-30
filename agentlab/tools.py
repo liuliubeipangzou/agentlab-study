@@ -18,7 +18,7 @@ import re
 import secrets
 import stat
 from dataclasses import dataclass
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from . import netguard
 from . import pysandbox
@@ -57,6 +57,17 @@ class Tool:
     handler: Callable
     risk: str = "read"
     timeout: float = 10.0
+    approval: Optional[Callable] = None
+    approval_policy: Optional[str] = None
+    approval_description: str = ""
+
+
+class ToolExecutionError(RuntimeError):
+    """带有有界诊断数据的工具失败，保留 stdout/stderr 供模型纠错。"""
+
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = details
 
 
 def _json_value(value: Any, path: str = "$", depth: int = 0) -> None:
@@ -222,6 +233,13 @@ class ToolRegistry:
             raise ValueError("timeout must be a positive finite number")
         if not callable(tool.handler):
             raise ValueError("tool handler must be callable")
+        if tool.approval is not None and (not callable(tool.approval)
+                or not isinstance(tool.approval_policy, str) or not tool.approval_policy.strip()):
+            raise ValueError("conditional approval requires a callable and stable approval_policy ID")
+        if tool.approval_policy is not None and not isinstance(tool.approval_policy, str):
+            raise ValueError("approval_policy must be a string or None")
+        if not isinstance(tool.approval_description, str):
+            raise ValueError("approval_description must be a string")
         _json_value(tool.parameters)
         _check_schema(tool.parameters)
         if tool.parameters.get("type") != "object":
@@ -229,13 +247,15 @@ class ToolRegistry:
         self._tools[tool.name] = Tool(
             name=tool.name, description=tool.description,
             parameters=copy.deepcopy(tool.parameters), handler=tool.handler,
-            risk=tool.risk, timeout=tool.timeout)
+            risk=tool.risk, timeout=tool.timeout, approval=tool.approval,
+            approval_policy=tool.approval_policy, approval_description=tool.approval_description)
 
     def get(self, name: str) -> Tool:
         """返回工具定义的副本，避免外部修改注册表的权限和参数规则。"""
         tool = self._tools[name]
         return Tool(tool.name, tool.description, copy.deepcopy(tool.parameters),
-                    tool.handler, tool.risk, tool.timeout)
+                    tool.handler, tool.risk, tool.timeout, tool.approval,
+                    tool.approval_policy, tool.approval_description)
 
     def definitions(self) -> list:
         return [{"type": "function", "function": {
@@ -247,7 +267,16 @@ class ToolRegistry:
         if type(call.name) is not str:
             return False
         tool = self._tools.get(call.name)
-        return tool is not None and tool.risk == "write"
+        if tool is None:
+            return False
+        if tool.risk == "write":
+            return True
+        if tool.approval is not None:
+            try:
+                return bool(tool.approval(copy.deepcopy(call.arguments)))
+            except Exception:
+                return True  # 策略异常时保守拒绝静默执行。
+        return False
 
     async def execute(self, call: ToolCall, context: ToolContext, approved: bool = False) -> dict:
         """失败作为结构化结果返回；取消信号继续向上传播。"""
@@ -259,8 +288,8 @@ class ToolRegistry:
             tool = self._tools.get(call.name)
             if tool is None:
                 raise ValueError("Unknown tool: %s" % call.name)
-            if tool.risk == "write" and approved is not True:
-                raise PermissionError("Approval required for write tool: %s" % call.name)
+            if self.requires_approval(call) and approved is not True:
+                raise PermissionError("Approval required for tool: %s" % call.name)
             _json_value(call.arguments)
             _validate(call.arguments, tool.parameters)
             arguments = copy.deepcopy(call.arguments)
@@ -292,6 +321,17 @@ class ToolRegistry:
             return {"ok": True, "value": value}
         except asyncio.TimeoutError:
             return {"ok": False, "error": "Tool '%s' timed out after %ss" % (tool.name, tool.timeout)}
+        except ToolExecutionError as error:
+            limit = context.max_output_chars
+            diagnostic = error.details or {}
+            # 保留结构化诊断字段；长输出分别收缩，避免整块 JSON 预览吞掉 stderr。
+            per_field = max(8, (limit - 96) // 8)
+            result = {"ok": False, "error": str(error)[:per_field * 2], "details": {}}
+            for name in ("stdout", "stderr", "exit_code", "timed_out", "limit_exceeded"):
+                value = diagnostic.get(name)
+                if value is not None:
+                    result["details"][name] = value[:per_field] if isinstance(value, str) else value
+            return result
         except Exception as error:
             message = "%s: %s" % (type(error).__name__, error)
             limit = context.max_output_chars if type(context.max_output_chars) is int else 8000
@@ -519,8 +559,18 @@ async def _run_python(arguments: dict, context: ToolContext) -> Any:
     if not outcome.get("ok"):
         # 代码失败（异常/超时/内存超限）必须在工具层也表现为失败，否则外层 ok=true
         # 会让模型误以为调用成功，从而忽略内部错误并继续编造结论。
-        raise RuntimeError(outcome.get("error") or "代码执行失败")
+        raise ToolExecutionError(outcome.get("error") or "代码执行失败", outcome)
     return outcome
+
+
+def _http_approval(arguments):
+    return arguments.get("method", "GET") not in ("GET", "HEAD")
+
+
+def _list_files(arguments, context):
+    from .workspace_files import list_workspace
+    return list_workspace(context.workspace, max_entries=arguments.get("limit", 200),
+                          max_depth=arguments.get("max_depth", 4))
 
 
 def create_builtin_tools() -> ToolRegistry:
@@ -533,6 +583,10 @@ def create_builtin_tools() -> ToolRegistry:
             "description": "工作区内的相对文件路径，不允许符号链接。"}
     registry.register(Tool("read_file", "读取工作区内的 UTF-8 文件，最大 256 KiB。",
         _parameters({"path": path}, ["path"]), _read_file))
+    registry.register(Tool("list_files", "列出工作区内的文件和目录，返回相对路径、类型与大小；跳过隐藏项及符号链接。",
+        _parameters({"limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                     "max_depth": {"type": "integer", "minimum": 1, "maximum": 6}}, []),
+        _list_files))
     registry.register(Tool("write_file", "写入工作区内的 UTF-8 文件并创建父目录，需要确认。",
         _parameters({"path": path, "content": {"type": "string", "maxLength": MAX_FILE_BYTES}},
                     ["path", "content"]), _write_file, risk="write"))
@@ -573,16 +627,19 @@ def create_builtin_tools() -> ToolRegistry:
                      "max_bytes": {"type": "integer", "minimum": 1024, "maximum": 16777216},
                      "max_chars": {"type": "integer", "minimum": 128, "maximum": 200000},
                      "max_redirects": {"type": "integer", "minimum": 0, "maximum": 3}},
-                    ["url"]), _http_request, timeout=60.0))
+                    ["url"]), _http_request, timeout=125.0,
+        approval=_http_approval, approval_policy="http-mutation-v1",
+        approval_description="GET/HEAD 读取无需审批；POST/PUT/PATCH/DELETE 可能修改外部数据，需要批准。"))
 
     # ---- 代码执行：子进程 + 资源限制 + 超时终止进程组 ----
     registry.register(Tool("run_python",
-        "在受限子进程中执行 Python 代码，用 result 变量返回数据；"
-        "stdout 也会被捕获。可做数据处理、计算与验证。",
+        "批准后以当前用户权限执行 Python 代码，用 result 变量返回数据并捕获 stdout/stderr。"
+        "可读写文件和联网，并非安全沙箱；用于数据处理、计算与验证。",
         _parameters({"code": {"type": "string", "minLength": 1, "maxLength": 100000},
                      "timeout": {"type": "number", "minimum": 0.5,
                                  "maximum": pysandbox.MAX_TIMEOUT},
                      "memory_mb": {"type": "integer", "minimum": 64,
                                    "maximum": pysandbox.MAX_MEMORY_MB}},
-                    ["code"]), _run_python, timeout=pysandbox.MAX_TIMEOUT + 10))
+                    ["code"]), _run_python, risk="write", timeout=pysandbox.MAX_TIMEOUT + 10,
+        approval_description="代码以当前用户身份运行，可以读写本机文件及访问网络。请确认代码后批准。"))
     return registry

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from agentlab.agent import Agent
 from agentlab.providers import OpenAICompatibleProvider
-from agentlab.server import App, MAX_BODY
+from agentlab.server import APIError, App, DELTA_LIMIT, MAX_BODY
 from agentlab.storage import SQLiteStore
 from agentlab.types import ModelResponse, ToolCall
 
@@ -165,8 +165,23 @@ class ServerTests(unittest.TestCase):
         provider = OpenAICompatibleProvider("previous-model", key, "https://previous.example/v1")
         old_agent = Agent(provider, store=self.app.store, tools=self.app.tools, workspace=self.root / "work")
         call = ToolCall("write_file", {"path": "restored.txt", "content": "restored"}, id="restore")
-        with patch("agentlab.server.OpenAICompatibleProvider.complete", new_callable=AsyncMock) as complete:
-            complete.side_effect = [ModelResponse(tool_calls=[call]), ModelResponse("done")]
+        # 产品默认开启流式，因此模型调用会走 stream() 而不是 complete()。两处都 mock，
+        # 否则测试会向真实网络发请求（曾经因此失败，且掩盖了真实的协议路径）。
+        with patch("agentlab.server.OpenAICompatibleProvider.stream", new_callable=AsyncMock) as stream, \
+                patch("agentlab.server.OpenAICompatibleProvider.complete", new_callable=AsyncMock) as complete:
+            # 两条路径共享同一份剧本。注意 chat/completions 的两个类引用指向同一个
+            # 类对象，因此 old_agent（无 on_delta，走 complete）与恢复任务（有 on_delta，
+            # 走 stream）会竞争同一个计数器；按"第一次给工具调用、之后给结论"推进即可。
+            plan = [ModelResponse(tool_calls=[call]), ModelResponse("done")]
+            state = {"index": 0}
+
+            async def queued(messages, on_delta=None, tools=None):
+                index = min(state["index"], len(plan) - 1)
+                state["index"] += 1
+                return plan[index]
+
+            stream.side_effect = queued
+            complete.side_effect = queued
             result = asyncio.run(old_agent.run("restore an earlier CLI session", "old-online"))
             self.assertEqual(result.status, "waiting_approval")
             self.assertEqual(self.app.public_config()["provider"], "demo")
@@ -419,3 +434,176 @@ class IncrementalEventTests(unittest.TestCase):
                 self.assertEqual(status, 200)
         status, _ = self.request("GET", "/api/health?probe=1")
         self.assertEqual(status, 200)
+
+
+class WorkspaceFileEndpointTests(unittest.TestCase):
+    """工作区文件接口：上传、下载、列表，以及路径穿越防护。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.workspace = self.base / "work"
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        (self.workspace / "seed.txt").write_text("seed", encoding="utf-8")
+        (self.base / "outside.txt").write_text("OUTSIDE-SECRET", encoding="utf-8")
+        self.environment = patch.dict("os.environ", {
+            "AGENTLAB_API_KEY": "", "AGENTLAB_MODEL": "deepseek-flash",
+            "AGENTLAB_BASE_URL": "https://api.deepseek.com",
+            "AGENTLAB_ALLOW_DEMO": "1", "AGENTLAB_PROVIDER": "demo"})
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        self.app = App(self.base / "data", self.workspace)
+        self.addCleanup(self.app.close)
+        self.server = self.app.create_server(port=0)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.thread.join, 2)
+        self.token = self.request("GET", "/api/bootstrap")[1]["csrf_token"]
+
+    def request(self, method, path, body=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        headers = {"Host": "127.0.0.1:{}".format(self.port)}
+        data = None
+        if method == "POST":
+            headers["Content-Type"] = "application/json"
+            headers["X-AgentLab-Token"] = self.token
+            data = json.dumps(body or {}).encode("utf-8")
+        try:
+            connection.request(method, path, body=data, headers=headers)
+            response = connection.getresponse()
+            raw = response.read().decode("utf-8")
+            value = json.loads(raw) if response.getheader("Content-Type", "").startswith("application/json") else raw
+            return response.status, value
+        finally:
+            connection.close()
+
+    def upload(self, name, content):
+        import base64 as _base64
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        return self.request("POST", "/api/files/import", {"files": [
+            {"name": name, "content_base64": _base64.b64encode(content).decode("ascii")}]})
+
+    def test_lists_seeded_file(self):
+        status, payload = self.request("GET", "/api/files")
+        self.assertEqual(status, 200)
+        self.assertIn("seed.txt", [row["path"] for row in payload["files"]])
+
+    def test_upload_then_list_and_download(self):
+        status, payload = self.upload("note.txt", "你好")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["files"][0]["path"], "note.txt")
+
+        status, listing = self.request("GET", "/api/files")
+        self.assertIn("note.txt", [row["path"] for row in listing["files"]])
+
+        status, downloaded = self.request("GET", "/api/files/note.txt")
+        self.assertEqual(status, 200)
+        import base64 as _base64
+        self.assertEqual(_base64.b64decode(downloaded["content_base64"]).decode("utf-8"), "你好")
+
+    def test_upload_does_not_overwrite_existing_file(self):
+        self.assertEqual(self.upload("note.txt", "first")[0], 200)
+        status, payload = self.upload("note.txt", "second")
+        self.assertEqual(status, 400)
+        self.assertIn("已存在", payload["error"])
+        _, downloaded = self.request("GET", "/api/files/note.txt")
+        import base64 as _base64
+        self.assertEqual(_base64.b64decode(downloaded["content_base64"]).decode("utf-8"), "first")
+
+    def test_path_traversal_attempts_are_rejected(self):
+        """任何形式的上跳都不能读到工作区之外的文件。"""
+        for path in ("../outside.txt", "..%2Foutside.txt", "%2e%2e%2foutside.txt",
+                     "....//outside.txt", "sub/../../outside.txt", "/etc/hosts"):
+            with self.subTest(path=path):
+                status, payload = self.request("GET", "/api/files/" + path)
+                self.assertEqual(status, 400, payload)
+                self.assertNotIn("OUTSIDE-SECRET", json.dumps(payload))
+
+    def test_upload_rejects_directory_or_hidden_names(self):
+        for name in ("../evil.txt", "sub/a.txt", ".hidden", "a" * 241 + ".txt"):
+            with self.subTest(name=name[:20]):
+                status, _ = self.upload(name, "x")
+                self.assertEqual(status, 400)
+
+    def test_oversized_upload_is_rejected(self):
+        status, payload = self.upload("big.bin", b"x" * (1024 * 1024 + 1))
+        self.assertEqual(status, 400)
+        self.assertIn("1 MiB", payload["error"])
+
+    def test_failed_multi_upload_leaves_no_partial_files(self):
+        """第二个文件重名时，第一个必须被回滚。"""
+        self.assertEqual(self.upload("taken.txt", "original")[0], 200)
+        import base64 as _base64
+        status, payload = self.request("POST", "/api/files/import", {"files": [
+            {"name": "fresh.txt", "content_base64": _base64.b64encode(b"new").decode()},
+            {"name": "taken.txt", "content_base64": _base64.b64encode(b"dup").decode()}]})
+        self.assertEqual(status, 400)
+        self.assertFalse((self.workspace / "fresh.txt").exists())
+        self.assertEqual((self.workspace / "taken.txt").read_text(), "original")
+
+    def test_missing_file_returns_client_error(self):
+        status, _ = self.request("GET", "/api/files/nope.txt")
+        self.assertEqual(status, 400)
+
+
+class WebStreamingConfigTests(unittest.TestCase):
+    """streaming 配置必须被真正接线，而不只是被校验。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.environment = patch.dict("os.environ", {
+            "AGENTLAB_API_KEY": "", "AGENTLAB_MODEL": "deepseek-flash",
+            "AGENTLAB_BASE_URL": "https://api.deepseek.com",
+            "AGENTLAB_ALLOW_DEMO": "1", "AGENTLAB_PROVIDER": "demo"})
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        self.app = App(Path(self.temp.name) / "data", Path(self.temp.name) / "work")
+        self.addCleanup(self.app.close)
+
+    def test_streaming_defaults_on_and_is_published(self):
+        config = self.app.api("GET", "/api/bootstrap", {})["config"]
+        self.assertIs(config["streaming"], True)
+
+    def test_delta_handler_follows_configuration(self):
+        job = {"events": [], "_session_ids": set(), "_delta": ""}
+        self.assertIsNotNone(self.app._delta_handler(job))
+        self.app._config["streaming"] = False
+        self.assertIsNone(self.app._delta_handler(job))
+
+    def test_delta_handler_accumulates_and_is_bounded(self):
+        job = {"events": [], "_session_ids": set(), "_delta": ""}
+        handler = self.app._delta_handler(job)
+        handler("一")
+        handler("二")
+        self.assertEqual(job["_delta"], "一二")
+        handler("")
+        handler(None)
+        self.assertEqual(job["_delta"], "一二")
+        # 超出上限后不再增长，避免内存被单次任务撑爆。
+        handler("x" * 300000)
+        self.assertEqual(len(job["_delta"]), DELTA_LIMIT)
+
+    def test_delta_is_exposed_but_internal_fields_are_not(self):
+        job_id = self.app.submit(lambda _job: asyncio.sleep(0))
+        with self.app._lock:
+            self.app._jobs[job_id]["_delta"] = "实时内容"
+        payload = self.app.job(job_id)
+        self.assertEqual(payload["delta"], "实时内容")
+        self.assertNotIn("_delta", payload)
+        for key in payload:
+            self.assertFalse(key.startswith("_"), key)
+
+    def test_invalid_streaming_value_is_rejected(self):
+        for value in ("yes", 1, None):
+            with self.subTest(value=value):
+                with self.assertRaises(APIError):
+                    self.app.configure({"streaming": value})
+
+    def test_streaming_can_be_toggled_off(self):
+        result = self.app.configure({"streaming": False})
+        self.assertIs(result["config"]["streaming"], False)
+        self.assertIs(self.app.api("GET", "/api/bootstrap", {})["config"]["streaming"], False)

@@ -114,10 +114,10 @@ class SearchSettingsTests(unittest.TestCase):
     def _agent_settings(self):
         return self.app._agent({"events": [], "_session_ids": set(), "run_id": "r"}).tool_settings
 
-    def test_defaults_to_no_explicit_backend(self):
-        """留空时由 web 模块自行选择免密钥后端。"""
+    def test_defaults_to_keyless_duckduckgo_backend(self):
+        """未配置检索后端时，默认显式落到免密钥的 DuckDuckGo。"""
         config = self.app.api("GET", "/api/bootstrap", {})["config"]
-        self.assertEqual(config["search_backend"], "")
+        self.assertEqual(config["search_backend"], "duckduckgo")
         self.assertFalse(config["has_search_key"])
 
     def test_search_settings_round_trip_and_reach_tools(self):

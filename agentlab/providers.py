@@ -4,17 +4,20 @@ HTTP 使用标准库；阻塞请求由 asyncio.to_thread 隔离。协程被取�
 网络线程无法被强行终止，仍可能运行至 socket timeout，且请求可能已产生费用。
 """
 import asyncio
+import concurrent.futures
 import ipaddress
+import inspect
 import json
 import math
 import os
 import shlex
 import socket
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from copy import deepcopy
-from typing import List
+from typing import Callable, List, Optional
 
 from .types import Message, ModelResponse, ToolCall, Usage
 
@@ -110,6 +113,148 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _StreamStopped(Exception):
+    """内部取消信号，不作为用户错误输出。"""
+
+
+class _StreamControl:
+    """协程与读取线程共享取消状态；关闭 socket 以唤醒阻塞中的读取。"""
+
+    def __init__(self):
+        self.stopped = threading.Event()
+        self.lock = threading.Lock()
+        self.response = None
+
+    def attach(self, response):
+        with self.lock:
+            self.response = response
+        if self.stopped.is_set():
+            self._close(response)
+            raise _StreamStopped()
+
+    @staticmethod
+    def _close(response):
+        # HTTPResponse.close() 本身可能等待 BufferedReader 的锁；先 shutdown
+        # 底层 socket，让正在 readline 的线程醒来。其他响应类型直接 close。
+        try:
+            raw = getattr(getattr(response, "fp", None), "raw", None)
+            sock = getattr(raw, "_sock", None)
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        except (OSError, ValueError):
+            pass
+        try:
+            response.close()
+        except (OSError, ValueError):
+            pass
+
+    def cancel(self):
+        self.stopped.set()
+        with self.lock:
+            response = self.response
+        if response is not None:
+            # 关闭 I/O 不得阻塞事件循环；读取线程同时检查 stopped，避免继续消费。
+            threading.Thread(target=self._close, args=(response,), daemon=True,
+                             name="agentlab-stream-close").start()
+
+
+class _StreamResponse:
+    """只在事件循环中组装一次响应；正文可即时交付，工具必须等完整校验后执行。"""
+
+    def __init__(self):
+        self.parts = []
+        self.calls = {}
+        self.finish = None
+        self.usage = None
+
+    def accept(self, event):
+        if not isinstance(event, dict) or "error" in event:
+            raise ProviderError("模型返回无效的流式事件或 API 错误。")
+        choices = event.get("choices")
+        if not isinstance(choices, list) or len(choices) > 1:
+            raise ProviderError("流式响应必须只包含请求的一个候选结果。")
+        pieces = []
+        for choice in choices:
+            if not isinstance(choice, dict) or type(choice.get("index", 0)) is not int or choice.get("index", 0) != 0:
+                raise ProviderError("模型流式候选编号无效。")
+            delta = choice.get("delta")
+            if not isinstance(delta, dict) or self.finish is not None:
+                raise ProviderError("模型流式消息结构或结束顺序无效。")
+            if delta.get("role") not in (None, "assistant"):
+                raise ProviderError("模型流式消息角色无效。")
+            piece = delta.get("content")
+            if piece is not None and not isinstance(piece, str):
+                raise ProviderError("模型流式正文必须为字符串。")
+            if piece:
+                self.parts.append(piece)
+                pieces.append(piece)
+            fragments = delta.get("tool_calls")
+            if fragments is not None:
+                if not isinstance(fragments, list):
+                    raise ProviderError("模型流式工具调用必须为列表。")
+                for fragment in fragments:
+                    self._tool_fragment(fragment)
+            reason = choice.get("finish_reason")
+            if reason is not None:
+                if reason not in ("stop", "tool_calls", "length", "content_filter"):
+                    raise ProviderError("模型流式结束原因无效。")
+                self.finish = reason
+                if reason == "length":
+                    raise ProviderError("模型响应达到输出上限；请提高 max_output_tokens 或缩短请求。")
+                if reason == "content_filter":
+                    raise ProviderError("模型 API 未提供可用响应（content_filter）。")
+        usage = event.get("usage")
+        if usage is not None:
+            if not isinstance(usage, dict) or any(type(usage.get(name)) is not int or usage[name] < 0
+                    for name in ("prompt_tokens", "completion_tokens")):
+                raise ProviderError("模型流式 token 用量无效。")
+            self.usage = {"prompt_tokens": usage["prompt_tokens"], "completion_tokens": usage["completion_tokens"]}
+        return pieces
+
+    def _tool_fragment(self, fragment):
+        if not isinstance(fragment, dict) or type(fragment.get("index")) is not int or not 0 <= fragment["index"] < 128:
+            raise ProviderError("模型流式工具编号无效。")
+        # 默认即 "function"：OpenAI 兼容服务的流式分片通常只在首片带 type，
+        # 后续分片省略。若保持 None，重组结果会被 _parse 拒绝，导致流式工具
+        # 调用全部失效。
+        call = self.calls.setdefault(fragment["index"], {"id": "", "type": "function",
+                                                        "function": {"name": "", "arguments": ""}})
+        identifier = fragment.get("id")
+        if identifier is not None:
+            if not isinstance(identifier, str):
+                raise ProviderError("模型流式工具 ID 无效。")
+            call["id"] += identifier
+        kind = fragment.get("type")
+        if kind is not None:
+            if kind != "function":
+                raise ProviderError("模型流式工具类型无效。")
+            call["type"] = kind
+        function = fragment.get("function")
+        if function is not None:
+            if not isinstance(function, dict):
+                raise ProviderError("模型流式函数结构无效。")
+            for name in ("name", "arguments"):
+                value = function.get(name)
+                if value is not None:
+                    if not isinstance(value, str):
+                        raise ProviderError("模型流式函数分片必须为字符串。")
+                    call["function"][name] += value
+
+    def body(self):
+        if self.finish is None:
+            raise ProviderError("模型流在 finish_reason 前结束，响应不完整。")
+        if self.usage is None:
+            raise ProviderError("模型流缺少 token 用量；请使用支持 include_usage 的服务或关闭流式。")
+        if sorted(self.calls) != list(range(len(self.calls))):
+            raise ProviderError("模型流式工具编号不连续。")
+        calls = [self.calls[index] for index in sorted(self.calls)]
+        if (self.finish == "tool_calls") != bool(calls):
+            raise ProviderError("模型流式结束原因与工具调用不一致。")
+        return {"choices": [{"message": {"role": "assistant", "content": "".join(self.parts),
+                                          "tool_calls": calls}, "finish_reason": self.finish}],
+                "usage": self.usage}
+
+
 def _reject_nonfinite(value):
     raise ValueError("JSON must be finite")
 
@@ -146,6 +291,7 @@ class OpenAICompatibleProvider:
     """
 
     MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+    supports_tool_streaming = True
 
     def __init__(self, model: str, api_key: str,
                  base_url: str = "https://api.openai.com/v1", timeout: float = 30,
@@ -199,37 +345,26 @@ class OpenAICompatibleProvider:
                 await asyncio.sleep(delay)
         raise ProviderError("模型请求失败。")  # Defensive; loop always returns or raises.
 
-    async def stream(self, messages: List[Message], on_delta) -> ModelResponse:
-        """流式请求：逐段回调正文增量，最后返回完整 ModelResponse。
+    async def stream(self, messages: List[Message], on_delta: Optional[Callable],
+                     tools: Optional[List[dict]] = None) -> ModelResponse:
+        """实时交付正文，并在完整流结束后返回校验过的正文、工具调用和用量。
 
-        只在**没有工具可调用**的回合使用。带工具时需要在流里重组 tool_calls 的分片
-        参数，收益低而正确性风险高，因此调用方应回退到 `complete()`。
+        一旦收到响应事件就不自动重试。取消时通知读取线程停止并关闭网络响应。
+        保留 stream(messages, callback) 用法，tools 可选且与 complete 的格式一致。
         """
+        if on_delta is not None and not callable(on_delta):
+            raise ProviderError("on_delta 必须是可调用对象或 None。")
         try:
-            payload = self._serialize(messages, [])
+            payload = self._serialize(messages, tools or [])
         except (TypeError, ValueError, KeyError, AttributeError):
-            raise ProviderError("请求包含无效消息、非有限 JSON 值。") from None
+            raise ProviderError("请求包含无效消息、工具定义或非有限 JSON 值。") from None
         streaming_payload = json.loads(payload.decode("utf-8"))
         streaming_payload["stream"] = True
-        streaming_payload.pop("tools", None)
-        streaming_payload.pop("tool_choice", None)
+        streaming_payload["stream_options"] = {"include_usage": True}
         encoded = json.dumps(streaming_payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
-
         for attempt in range(self.max_retries + 1):
             try:
-                # 流式读取是阻塞 I/O，放进线程执行；增量先在后台收集，回到事件循环后回调。
-                deltas, content, usage, finish = await asyncio.to_thread(self._stream_collect, encoded)
-                for piece in deltas:
-                    if on_delta:
-                        on_delta(piece)
-                body = content
-                if finish == "length":
-                    raise ProviderError("模型响应达到输出上限；请提高 max_output_tokens 或缩短请求。")
-                if finish == "content_filter":
-                    raise ProviderError("模型 API 未提供可用响应（content_filter）。")
-                if not body:
-                    raise ProviderError("模型返回了空响应。")
-                return ModelResponse(content=body, tool_calls=[], usage=usage)
+                return await self._stream_once(encoded, on_delta)
             except _RetryableError as exc:
                 if attempt == self.max_retries:
                     raise ProviderError(str(exc)) from None
@@ -237,21 +372,74 @@ class OpenAICompatibleProvider:
                 await asyncio.sleep(delay)
         raise ProviderError("模型请求失败。")
 
-    def _stream_collect(self, payload):
-        """在线程中读完整个 SSE 流，返回 (增量列表, 完整正文, usage, finish_reason)。"""
-        deltas, content, usage, finish = [], "", Usage(), None
-        for kind, value in self._stream_request(payload):
-            if kind == "delta":
-                deltas.append(value)
-                content += value
-            elif kind == "usage":
-                usage = value
-            elif kind == "finish":
-                finish = value
-        return deltas, content, usage, finish
+    async def _stream_once(self, payload, on_delta):
+        """有界队列连接阻塞 HTTP 线程与 asyncio，不等全流结束才显示首字。"""
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue(maxsize=32)
+        control = _StreamControl()
 
-    def _stream_request(self, payload):
-        """同步读取 SSE 流，产出 ('delta'|'content'|'usage'|'finish', value)。"""
+        def deliver(item):
+            if control.stopped.is_set():
+                return False
+            delivery = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+            while not control.stopped.is_set():
+                try:
+                    delivery.result(timeout=0.1)
+                    return True
+                except concurrent.futures.TimeoutError:
+                    continue
+                except concurrent.futures.CancelledError:
+                    return False
+            delivery.cancel()
+            return False
+
+        def read():
+            try:
+                for item in self._stream_request(payload, control):
+                    if not deliver(item):
+                        return
+            except _StreamStopped:
+                pass
+            except Exception as exc:
+                # 底层未预期异常不能把请求对象、地址或凭据暴露给调用方，
+                # 但必须保留异常类型，否则"模型流式读取失败"这种消息无从诊断。
+                if isinstance(exc, ProviderError):
+                    error = exc
+                else:
+                    error = ProviderError("模型流式读取失败（%s）。" % type(exc).__name__)
+                deliver(("error", error))
+
+        worker = loop.run_in_executor(None, read)
+        assembled = _StreamResponse()
+        started = False
+        finished = False
+        try:
+            while True:
+                kind, value = await queue.get()
+                if kind == "error":
+                    if started and isinstance(value, _RetryableError):
+                        raise ProviderError("模型流在部分响应后中断；未自动重试，请检查结果后重新发起。") from None
+                    raise value
+                if kind == "done":
+                    result = self._parse(assembled.body())
+                    finished = True
+                    return result
+                started = True
+                for piece in assembled.accept(value):
+                    if on_delta is not None:
+                        returned = on_delta(piece)
+                        if inspect.isawaitable(returned):
+                            await returned
+        finally:
+            if not finished:
+                control.cancel()
+            # 不等待被取消的阻塞线程；control 会关闭响应并停止后续读取和队列提交。
+            # executor Future 持有线程结果，读取函数已处理所有异常。
+            if worker.done():
+                worker.result()
+
+    def _stream_request(self, payload, control):
+        """按 SSE 事件边界解析 JSON；必须收到 [DONE]，普通 EOF 一律视为中断。"""
         request = urllib.request.Request(self.base_url + "/chat/completions", data=payload,
                                          headers={"Authorization": "Bearer " + self._api_key,
                                                   "Content-Type": "application/json",
@@ -260,41 +448,41 @@ class OpenAICompatibleProvider:
         opener = urllib.request.build_opener(_NoRedirect())
         try:
             with opener.open(request, timeout=self.timeout) as response:
+                control.attach(response)
                 buffered = 0
-                for raw_line in response:
+                data_lines = []
+                while True:
+                    if control.stopped.is_set():
+                        raise _StreamStopped()
+                    raw_line = response.readline(self.MAX_RESPONSE_BYTES + 1 - buffered)
+                    if control.stopped.is_set():
+                        raise _StreamStopped()
+                    if not raw_line:
+                        raise ProviderError("模型流在 [DONE] 前结束，响应不完整。")
                     buffered += len(raw_line)
                     if buffered > self.MAX_RESPONSE_BYTES:
                         raise ProviderError("模型流式响应超过 4 MiB 限制。")
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line or line.startswith(":"):
+                    line = raw_line.decode("utf-8").rstrip("\r\n")
+                    if line.startswith(":"):
                         continue
-                    if not line.startswith("data:"):
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].removeprefix(" "))
                         continue
-                    data = line[5:].strip()
+                    if line:
+                        # SSE 的 event/id/retry 字段不会改变 Chat Completions 内容。
+                        continue
+                    if not data_lines:
+                        continue
+                    data = "\n".join(data_lines)
+                    data_lines = []
                     if data == "[DONE]":
+                        yield ("done", None)
                         return
                     try:
                         event = _strict_json(data)
                     except ValueError:
                         raise ProviderError("模型流式响应包含无效 JSON。") from None
-                    if not isinstance(event, dict):
-                        continue
-                    for item in event.get("choices") or []:
-                        if not isinstance(item, dict):
-                            continue
-                        delta = item.get("delta")
-                        if isinstance(delta, dict):
-                            piece = delta.get("content")
-                            if isinstance(piece, str) and piece:
-                                yield ("delta", piece)
-                        if item.get("finish_reason"):
-                            yield ("finish", item["finish_reason"])
-                    usage_data = event.get("usage")
-                    if isinstance(usage_data, dict):
-                        incoming = usage_data.get("prompt_tokens", 0)
-                        outgoing = usage_data.get("completion_tokens", 0)
-                        if type(incoming) is int and type(outgoing) is int and incoming >= 0 and outgoing >= 0:
-                            yield ("usage", Usage(input_tokens=incoming, output_tokens=outgoing))
+                    yield ("event", event)
         except urllib.error.HTTPError as exc:
             code = exc.code
             retry_after = 0.0

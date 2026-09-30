@@ -26,6 +26,9 @@ from .evaluation import EvalCase, evaluate
 from .providers import DemoProvider, OpenAICompatibleProvider, ProviderError
 from .storage import SQLiteStore
 from .tools import create_builtin_tools
+from .workspace_files import import_files as upload_workspace_files
+from .workspace_files import list_workspace as list_workspace_files
+from .workspace_files import read_file as read_workspace_file
 from .types import Message
 
 
@@ -36,6 +39,8 @@ RESOURCES = PACKAGE / "resources"
 DOC_NAMES = ("architecture", "learning-path", "tools", "providers", "memory-workflows", "operations", "validation", "web-ui")
 IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 MAX_BODY = 2 * 1024 * 1024
+# 单个任务保留的实时增量上限（字符）；超出即截断，避免内存被撑爆。
+DELTA_LIMIT = 200000
 
 
 def _query_int(query, name, default):
@@ -91,24 +96,35 @@ class App:
             default_provider = "demo"
         self._config = {"provider": default_provider,
                         "model": os.environ.get("AGENTLAB_MODEL") or "deepseek-flash",
-                        "base_url": os.environ.get("AGENTLAB_BASE_URL") or "https://api.deepseek.com"}
+                        "base_url": os.environ.get("AGENTLAB_BASE_URL") or "https://api.deepseek.com",
+                        "streaming": True}
         self._api_key = os.environ.get("AGENTLAB_API_KEY", "").strip()
         # 检索后端配置（web_search 使用）；随 settings 下发到工具上下文。
         self._search_settings = {
-            "backend": os.environ.get("AGENTLAB_SEARCH_BACKEND", "").strip() or None,
-            "api_key": os.environ.get("AGENTLAB_SEARCH_API_KEY", "").strip() or None,
-            "searx_url": os.environ.get("AGENTLAB_SEARX_URL", "").strip() or None,
+            "backend": os.environ.get("AGENTLAB_SEARCH_BACKEND", "").strip() or "duckduckgo",
+            "api_key": os.environ.get("AGENTLAB_SEARCH_API_KEY", "").strip(),
+            "searx_url": os.environ.get("AGENTLAB_SEARX_URL", "").strip(),
         }
-        self._secrets = {self._api_key} if self._api_key else set()
+        self._secrets = {value for value in (self._api_key, self._search_settings["api_key"]) if value}
+        try:
+            self._search_settings = self._validate_search(self._search_settings)
+        except APIError:
+            self._search_settings = {"backend": "duckduckgo", "api_key": "", "searx_url": ""}
+            self.config_warning = "环境中的检索配置无效，当前使用 DuckDuckGo；请在设置中重新保存。"
         settings = self.data_dir / "web-settings.json"
         if settings.is_file():
             try:
                 saved = json.loads(settings.read_text(encoding="utf-8"))
                 candidate = {name: saved.get(name, default) for name, default in self._config.items()}
                 self._validate_config(candidate, self._api_key)
+                search = dict(self._search_settings,
+                              backend=saved.get("search_backend", self._search_settings["backend"]),
+                              searx_url=saved.get("searx_url", self._search_settings["searx_url"]))
+                self._search_settings = self._validate_search(search)
                 self._config = candidate
             except (APIError, ValueError, TypeError, AttributeError, OSError, ProviderError):
-                self.config_warning = "已保存的模型配置无效，当前使用演示模式；请在设置中重新保存。"
+                mode = "演示模式" if default_provider == "demo" else "真实模型默认配置"
+                self.config_warning = "已保存的配置无效，当前使用%s；请在设置中重新保存。" % mode
         self._loop = asyncio.new_event_loop()
         self._ready = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, name="agentlab-asyncio", daemon=True)
@@ -132,6 +148,10 @@ class App:
     def _validate_config(self, config, key):
         if config.get("provider") not in ("demo", "openai"):
             raise APIError(400, "provider 只能为 demo 或 openai")
+        if config["provider"] == "demo" and not self.allow_demo:
+            raise APIError(400, "演示模式已停用；请选择真实模型并填写 API Key")
+        if type(config.get("streaming")) is not bool:
+            raise APIError(400, "streaming 必须为布尔值")
         if any(not isinstance(config.get(name), str) for name in ("model", "base_url")):
             raise APIError(400, "model 和 base_url 必须为字符串")
         if not isinstance(key, str):
@@ -143,6 +163,32 @@ class App:
             # 配置类错误必须以 400 返回；否则会冒到 HTTP 层被当成 500 内部错误。
             raise APIError(400, str(exc)) from None
 
+    def _validate_search(self, search):
+        backend, url, key = search.get("backend"), search.get("searx_url"), search.get("api_key")
+        if not isinstance(backend, str) or not isinstance(url, str) or not isinstance(key, str):
+            raise APIError(400, "检索配置必须为文本")
+        backend = {"": "duckduckgo", "ddg": "duckduckgo", "searx": "searxng"}.get(
+            backend.strip().lower(), backend.strip().lower())
+        if backend not in ("duckduckgo", "brave", "tavily", "searxng"):
+            raise APIError(400, "请选择 DuckDuckGo、Brave、Tavily 或 SearXNG 检索后端")
+        url, key = url.strip(), key.strip()
+        if len(key) > 4000 or any(ord(character) < 32 for character in key):
+            raise APIError(400, "检索 API Key 格式无效")
+        if url:
+            try:
+                parsed = urlsplit(url)
+                port = parsed.port
+                if (len(url) > 2000 or parsed.scheme not in ("http", "https") or not parsed.hostname
+                        or parsed.username is not None or parsed.password is not None
+                        or parsed.query or parsed.fragment or any(character.isspace() for character in url)
+                        or (port is not None and not 1 <= port <= 65535)):
+                    raise ValueError()
+            except ValueError:
+                raise APIError(400, "SearXNG 地址需要 HTTP(S) URL，不能包含认证、查询参数或片段") from None
+        if backend == "searxng" and not url:
+            raise APIError(400, "SearXNG 后端需要实例地址")
+        return {"backend": backend, "api_key": key, "searx_url": url}
+
     def configure(self, payload):
         with self._lock:
             if any(job["status"] == "running" for job in self._jobs.values()):
@@ -153,9 +199,14 @@ class App:
             supplied = payload.get("api_key", "")
             if not isinstance(supplied, str):
                 raise APIError(400, "API Key 必须为字符串")
-            key = supplied.strip() or self._api_key
+            for flag in ("clear_api_key", "clear_search_api_key"):
+                if flag in payload and type(payload[flag]) is not bool:
+                    raise APIError(400, flag + " 必须为布尔值")
+            if payload.get("clear_api_key") and supplied.strip():
+                raise APIError(400, "不能同时设置并清除 API Key")
+            key = "" if payload.get("clear_api_key") else supplied.strip() or self._api_key
             self._validate_config(candidate, key)
-            # 检索后端配置：留空表示沿用环境变量或免密钥默认后端。
+            # Empty credential fields retain the current key; clearing is explicit.
             search = dict(self._search_settings)
             for field, limit in (("search_backend", 32), ("search_api_key", 4000), ("searx_url", 2000)):
                 if field in payload:
@@ -166,10 +217,17 @@ class App:
                         raise APIError(400, "检索配置字段无效：" + field)
                     target = {"search_backend": "backend", "search_api_key": "api_key",
                               "searx_url": "searx_url"}[field]
-                    search[target] = value.strip() or None
+                    if field != "search_api_key" or value.strip():
+                        search[target] = value.strip()
+            if payload.get("clear_search_api_key"):
+                if isinstance(payload.get("search_api_key"), str) and payload["search_api_key"].strip():
+                    raise APIError(400, "不能同时设置并清除检索 API Key")
+                search["api_key"] = ""
+            search = self._validate_search(search)
             temporary = self.data_dir / (".web-settings-" + uuid.uuid4().hex + ".tmp")
             try:
-                temporary.write_text(json.dumps(candidate, ensure_ascii=False, indent=2), encoding="utf-8")
+                saved = dict(candidate, search_backend=search["backend"], searx_url=search["searx_url"])
+                temporary.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
                 temporary.replace(self.data_dir / "web-settings.json")
             finally:
                 temporary.unlink(missing_ok=True)
@@ -226,6 +284,27 @@ class App:
                      workspace=self.workspace, on_event=event,
                      tool_settings={"search": dict(self._search_settings)})
 
+    def _delta_handler(self, job):
+        """把模型增量累积到任务上，供界面边生成边显示。
+
+        增量不写入 events 数组：它是高频数据，塞进去会挤掉真正有价值的执行事件
+        （上限 5000 条），也会让每次增量轮询都重复传输。
+        """
+        if not self._config.get("streaming", True):
+            return None
+
+        def on_delta(piece):
+            if not isinstance(piece, str) or not piece:
+                return
+            with self._lock:
+                buffer = job.get("_delta") or ""
+                if len(buffer) >= DELTA_LIMIT:
+                    return
+                # 严格截断：单个超大片段也不能让缓冲越界。
+                job["_delta"] = (buffer + piece)[:DELTA_LIMIT]
+
+        return on_delta
+
     def submit(self, operation, session_id=None, require_provider=False):
         with self._lock:
             if self._closed:
@@ -249,7 +328,7 @@ class App:
             job_id = uuid.uuid4().hex
             job = {"job_id": job_id, "status": "running", "result": None, "error": None,
                    "events": [], "session_id": session_id, "_task": None, "_cancel": False,
-                   "_session_ids": set()}
+                   "_session_ids": set(), "_delta": ""}
             self._jobs[job_id] = job
             asyncio.run_coroutine_threadsafe(self._run_job(job, operation), self._loop)
             return job_id
@@ -279,9 +358,13 @@ class App:
 
     def job(self, job_id):
         with self._lock:
-            if job_id not in self._jobs:
+            job = self._jobs.get(job_id)
+            if job is None:
                 raise APIError(404, "未找到后台任务")
-            return copy.deepcopy({key: value for key, value in self._jobs[job_id].items() if not key.startswith("_")})
+            payload = {key: value for key, value in job.items() if not key.startswith("_")}
+            # 增量正文单独放行：内部字段以下划线开头，但它正是界面需要的实时内容。
+            payload["delta"] = job.get("_delta") or ""
+            return copy.deepcopy(payload)
 
     def job_events(self, job_id, since=0):
         """增量获取任务事件，避免轮询时反复传输完整的 5000 条事件列表。
@@ -299,6 +382,7 @@ class App:
             start = min(since, len(events))
             return {"job_id": job_id, "status": job["status"],
                     "total": len(events), "since": start,
+                    "delta": job.get("_delta") or "",
                     "events": copy.deepcopy(events[start:])}
 
     def cancel(self, job_id):
@@ -411,6 +495,17 @@ class App:
                 return self.job(remainder)
             if path == "/api/knowledge":
                 return {"documents": self.store.list_documents(), "stats": self.store.knowledge_stats()}
+            if path == "/api/files":
+                try:
+                    return list_workspace_files(self.workspace)
+                except ValueError as exc:
+                    raise APIError(400, str(exc)) from None
+            if path.startswith("/api/files/"):
+                relative = urllib.parse.unquote(path[len("/api/files/"):])
+                try:
+                    return read_workspace_file(self.workspace, relative)
+                except ValueError as exc:
+                    raise APIError(400, str(exc)) from None
             if path.startswith("/api/docs/"):
                 name = path[len("/api/docs/"):]
                 if name.endswith(".md"):
@@ -439,7 +534,8 @@ class App:
                 if not isinstance(session_id, str) or not IDENTIFIER.fullmatch(session_id):
                     raise APIError(400, "无效的会话 ID")
                 async def run(job):
-                    return await self._agent(job).run(prompt, session_id)
+                    agent = self._agent(job)
+                    return await agent.run(prompt, session_id, on_delta=self._delta_handler(job))
                 return {"session_id": session_id, "job_id": self.submit(run, session_id, require_provider=True)}
             match = re.fullmatch(r"/api/sessions/([A-Za-z0-9_-]{1,128})/(approve|recover)", path)
             if match:
@@ -452,7 +548,8 @@ class App:
                 if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
                     raise APIError(400, "approved_call_ids 必须为调用 ID 列表，空列表表示全部拒绝")
                 async def approve(job):
-                    return await self._agent(job).resume(session_id, ids)
+                    agent = self._agent(job)
+                    return await agent.resume(session_id, ids, on_delta=self._delta_handler(job))
                 return {"session_id": session_id, "job_id": self.submit(approve, session_id, require_provider=True)}
             if path == "/api/connection-test":
                 async def connection(job):
@@ -463,6 +560,11 @@ class App:
                 return {"job_id": self.submit(connection, require_provider=True)}
             if path == "/api/knowledge/import":
                 return self.import_files(payload)
+            if path == "/api/files/import":
+                try:
+                    return upload_workspace_files(self.workspace, payload)
+                except ValueError as exc:
+                    raise APIError(400, str(exc)) from None
             if path == "/api/knowledge/search":
                 query = payload.get("query")
                 if not isinstance(query, str) or len(query) > 4000:
