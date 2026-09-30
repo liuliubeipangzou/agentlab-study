@@ -23,7 +23,8 @@ python3 -m agentlab serve --open
 以下命令均在 `agent-lab` 目录运行：
 
 ```bash
-cd /Users/lei.tu/code/task/study/agent-lab
+# 先进入项目的 agent-lab 目录（克隆后即仓库根目录）
+cd agent-lab
 
 # 不需要 pip install，先观察完整的 model → tool → model 事件流
 python3 -m agentlab --verbose run '/calc (20 + 1) * 2'
