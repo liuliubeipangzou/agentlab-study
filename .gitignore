@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.agentlab/
+workspace/
+.env
+*.egg-info/
+dist/
+build/
+.DS_Store

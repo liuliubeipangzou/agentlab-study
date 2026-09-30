@@ -1,0 +1,49 @@
+# 配置、边界与排障
+
+## AgentConfig
+
+| 参数 | 默认值 | 语义 |
+| --- | ---: | --- |
+| max_steps | 8 | 每个用户任务的最大模型调用数，审批恢复不重置 |
+| max_tool_calls | 16 | 每个任务的工具调用预算，包括用户拒绝的调用 |
+| max_context_chars | 24000 | system 文本与序列化消息的字符上限，不含工具 schema |
+| max_total_tokens | 20000 | API 已报告 usage 的累计上限 |
+| run_timeout | 120 秒 | 同一任务累计推进时间，审批等待不计入 |
+| tool_output_chars | 8000 | 序列化工具 value 的长度上限，最低 128 |
+| system_prompt | 中文助手提示 | 可替换的应用行为描述 |
+
+token 预算在响应后累计，达到限制便停止继续调用。它不是严格费用封顶：单次请求可能越过预算，重试也可能计费；未返回 usage 的兼容服务按 0 记录。若要更紧的控制，请同时设置 Provider 的 `max_output_tokens`、`max_retries` 和 Agent 步数。
+
+```python
+from agentlab import AgentConfig
+
+config = AgentConfig(max_steps=5, max_tool_calls=8, run_timeout=60,
+                     max_context_chars=16000, tool_output_chars=4000)
+```
+
+## 支持范围
+
+- 文件工具要求支持 `dir_fd` 和 `O_NOFOLLOW` 的 POSIX 环境（macOS/Linux）。文件限制 256 KiB，只接受工作区内相对路径，拒绝符号链接；Windows 尚未验证。
+- 工具处理器是可信的本地 Python 代码；框架不能隔离恶意插件或阻止其直接访问系统。需要运行不可信代码时，应另加进程/容器沙箱。
+- 同步工具和 HTTP 请求使用线程。协程超时只停止等待，不能强杀线程；写入可能已经生效。取消之后先确认副作用，再决定是否重复发起。
+- SQLite 支持本地多个进程协作，非分布式数据库。消息历史、事件和文档可持续增长，需要自行备份与保留策略。所有数据均未加密。
+- 知识库是有界的本地词法 BM25 索引，不提供语义 embedding。只接收 UTF-8 `.md`/`.txt`，不自动解析 PDF、网页或 Office 文件。
+- Agent 的消息和审批检查点可恢复；DAG 当前只在进程内调度，不提供整个工作流自动续跑。重试不保证副作用幂等。
+- Planner 仅做计划生成与结构校验，不等价于任务可完成性证明；其模型调用拥有单独的 timeout/有限修复次数，不计入 Agent 的 usage。评测器也不会自动关闭调用方创建的 Store，factory 的资源由调用方负责释放。
+- 真实 API 支持范围详见 providers 文档。测试模拟 HTTP，验证协议和错误处理；在线服务连通性仍需使用自己的 Key 验证。
+
+## 排障
+
+| 现象 | 处理 |
+| --- | --- |
+| 输出 Demo 学习指南 | 离线模式仅识别斜线命令；自然语言任务使用 `--provider openai` |
+| 缺少 AGENTLAB_MODEL/API_KEY | 用 shell export，`.env` 不会自动加载 |
+| 审批提示执行环境不一致 | 沿用创建检查点时的 provider、workspace 和工具注册表 |
+| 会话正在运行 | 等待原进程完成；崩溃后待租约到期再 recover |
+| 检测到中断运行 | 运行 recover，核对可能发生的副作用后重新发起任务 |
+| limited | inspect/trace 查看原因，再缩短任务或合理调整配置 |
+| search 无结果 | 先 ingest；使用文档中实际出现的中文或英文关键词 |
+| tool error | 查看 tool 消息中的结构化错误与参数 schema |
+| 模型返回无效响应 | 兼容服务必须支持工具调用协议；trace 可定位模型阶段 |
+
+命令行完成/等待审批退出码为 `0`，运行失败/超限为 `1`，输入或配置错误为 `2`，用户中断为 `130`。服务端、Web UI 或其他程序集成应优先检查 `AgentResult.status`，而不是只看是否有文本。

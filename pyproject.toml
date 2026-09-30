@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentlab-study"
+version = "0.1.0"
+description = "Readable, dependency-free Python agent framework for learning"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+agentlab = "agentlab.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agentlab*"]
+
+[tool.setuptools.package-data]
+agentlab = [
+    "web/*.html", "web/*.css", "web/*.js",
+    "resources/docs/*.md", "resources/knowledge/*.md",
+]
