@@ -87,12 +87,21 @@ function navigate(view, updateHash = true) {
 }
 function applyConfig(config) {
   state.config = config; const demo = config.provider !== "openai";
+  // 真实模型但没有 Key 是无法工作的状态，必须显著提示，而不是让用户对着无响应的输入框发呆。
+  const needsKey = !demo && !config.has_api_key;
   $("#provider-badge").replaceChildren(el("span", "status-dot"), document.createTextNode(demo ? "演示模式" : "真实模型")); $("#provider-badge").classList.toggle("demo-badge", demo);
   $("#model-label").textContent = demo ? "Demo · 无需 API Key" : config.model;
-  $("#mode-description").textContent = demo ? "当前使用演示模型，输入示例指令即可体验完整 Agent 流程。" : "已配置 " + config.model + "，可以直接用自然语言提出任务。写入操作需要审批。";
-  $("#banner-settings").firstChild.textContent = demo ? "配置真实模型" : "模型设置";
+  $("#mode-banner").classList.toggle("needs-key", needsKey);
+  $("#mode-description").textContent = demo
+    ? "当前使用演示模型，输入示例指令即可体验完整 Agent 流程。"
+    : (needsKey ? "尚未配置 API Key，Agent 无法调用模型。请填写密钥后即可开始。"
+                : "已配置 " + config.model + "，可以直接用自然语言提出任务。写入与执行代码需要审批。");
+  $("#banner-settings").firstChild.textContent = (demo || needsKey) ? "去配置模型" : "模型设置";
   $("#api-key-status").textContent = config.has_api_key ? "本次启动已设置" : "未设置"; $("#settings-saved-status").textContent = "已保存 · " + (demo ? "演示模式" : "真实模型");
-  $("#config-provider").value = config.provider || "demo"; $("#config-model").value = config.model || "deepseek-flash"; $("#config-base-url").value = config.base_url || "https://api.deepseek.com";
+  $("#config-provider").value = config.provider || "openai"; $("#config-model").value = config.model || "deepseek-flash"; $("#config-base-url").value = config.base_url || "https://api.deepseek.com";
+  if (config.search_backend !== undefined) $("#config-search-backend").value = config.search_backend || "";
+  if (config.has_search_key !== undefined) $("#search-key-status").textContent = config.has_search_key ? "已设置" : "(可选，留空使用免密钥后端)";
+  if (needsKey && state.view === "chat") { const keyField = $("#config-api-key"); if (keyField && !keyField.value) keyField.placeholder = "在此粘贴 API Key 后保存"; }
 }
 async function refreshSessions() { const result = await api("/api/sessions"); state.sessions = result.sessions || []; state.lastRefresh = Date.now(); renderSessions(); }
 function renderSessions() {
@@ -299,9 +308,19 @@ async function startExperiment(kind) {
   poll();
 }
 async function saveSettings(event) {
-  event.preventDefault(); const payload = {provider: $("#config-provider").value, model: $("#config-model").value.trim(), base_url: $("#config-base-url").value.trim()}, key = $("#config-api-key"); if (key.value.trim()) payload.api_key = key.value.trim(); busy($("#save-settings"), true);
-  try { const result = await api("/api/config", payload); applyConfig(result.config); show($("#connection-result"), false); toast("模型配置已保存。切换模型后请新建对话。"); }
-  finally { key.value = ""; delete payload.api_key; busy($("#save-settings"), false); }
+  event.preventDefault(); const payload = {provider: $("#config-provider").value, model: $("#config-model").value.trim(), base_url: $("#config-base-url").value.trim()}, key = $("#config-api-key");
+  if (key.value.trim()) payload.api_key = key.value.trim();
+  const searchBackend = $("#config-search-backend"), searchKey = $("#config-search-key"), searxUrl = $("#config-searx-url");
+  if (searchBackend) payload.search_backend = searchBackend.value;
+  if (searchKey && searchKey.value.trim()) payload.search_api_key = searchKey.value.trim();
+  if (searxUrl) payload.searx_url = searxUrl.value.trim();
+  busy($("#save-settings"), true);
+  try {
+    const result = await api("/api/config", payload); applyConfig(result.config); show($("#connection-result"), false);
+    toast(result.config.has_api_key ? "配置已保存。" : "已保存，但还没有 API Key：填写后才能真正调用模型。",
+          result.config.has_api_key ? "success" : "error");
+  }
+  finally { key.value = ""; if (searchKey) searchKey.value = ""; delete payload.api_key; delete payload.search_api_key; busy($("#save-settings"), false); }
 }
 async function testConnection() {
   busy($("#test-connection"), true); const host = $("#connection-result"); host.className = "connection-result"; host.textContent = "正在测试已保存的模型连接…";

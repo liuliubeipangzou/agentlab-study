@@ -63,9 +63,23 @@ class App:
         self._servers = []
         self._closed = False
         self.config_warning = ""
-        self._config = {"provider": "demo", "model": os.environ.get("AGENTLAB_MODEL") or "deepseek-flash",
+        # 默认使用真实模型。demo 是离线规则演示，必须显式开启：
+        # 同时设置 AGENTLAB_ALLOW_DEMO=1 与 AGENTLAB_PROVIDER=demo。
+        self.allow_demo = os.environ.get("AGENTLAB_ALLOW_DEMO", "").strip().lower() in ("1", "true", "yes", "on")
+        requested = os.environ.get("AGENTLAB_PROVIDER", "").strip().lower()
+        default_provider = "openai"
+        if requested == "demo" and self.allow_demo:
+            default_provider = "demo"
+        self._config = {"provider": default_provider,
+                        "model": os.environ.get("AGENTLAB_MODEL") or "deepseek-flash",
                         "base_url": os.environ.get("AGENTLAB_BASE_URL") or "https://api.deepseek.com"}
         self._api_key = os.environ.get("AGENTLAB_API_KEY", "").strip()
+        # 检索后端配置（web_search 使用）；随 settings 下发到工具上下文。
+        self._search_settings = {
+            "backend": os.environ.get("AGENTLAB_SEARCH_BACKEND", "").strip() or None,
+            "api_key": os.environ.get("AGENTLAB_SEARCH_API_KEY", "").strip() or None,
+            "searx_url": os.environ.get("AGENTLAB_SEARX_URL", "").strip() or None,
+        }
         self._secrets = {self._api_key} if self._api_key else set()
         settings = self.data_dir / "web-settings.json"
         if settings.is_file():
@@ -90,7 +104,11 @@ class App:
 
     def public_config(self):
         with self._lock:
-            return dict(self._config, has_api_key=bool(self._api_key))
+            return dict(self._config, has_api_key=bool(self._api_key),
+                        search_backend=self._search_settings.get("backend") or "",
+                        has_search_key=bool(self._search_settings.get("api_key")),
+                        searx_url=self._search_settings.get("searx_url") or "",
+                        allow_demo=self.allow_demo)
 
     def _validate_config(self, config, key):
         if config.get("provider") not in ("demo", "openai"):
@@ -100,18 +118,36 @@ class App:
         if not isinstance(key, str):
             raise APIError(400, "API Key 必须为字符串")
         # Constructor validates endpoints and credentials without making any request.
-        OpenAICompatibleProvider(config["model"], key or "validation-only", config["base_url"])
+        try:
+            OpenAICompatibleProvider(config["model"], key or "validation-only", config["base_url"])
+        except ProviderError as exc:
+            # 配置类错误必须以 400 返回；否则会冒到 HTTP 层被当成 500 内部错误。
+            raise APIError(400, str(exc)) from None
 
     def configure(self, payload):
         with self._lock:
             if any(job["status"] == "running" for job in self._jobs.values()):
                 raise APIError(409, "请等待当前任务完成或取消后再修改配置")
             candidate = {name: payload.get(name, value) for name, value in self._config.items()}
+            if candidate.get("provider") == "demo" and not self.allow_demo:
+                raise APIError(400, "演示模式已停用；请选择真实模型并填写 API Key")
             supplied = payload.get("api_key", "")
             if not isinstance(supplied, str):
                 raise APIError(400, "API Key 必须为字符串")
             key = supplied.strip() or self._api_key
             self._validate_config(candidate, key)
+            # 检索后端配置：留空表示沿用环境变量或免密钥默认后端。
+            search = dict(self._search_settings)
+            for field, limit in (("search_backend", 32), ("search_api_key", 4000), ("searx_url", 2000)):
+                if field in payload:
+                    value = payload.get(field)
+                    if value is None:
+                        continue
+                    if not isinstance(value, str) or len(value) > limit:
+                        raise APIError(400, "检索配置字段无效：" + field)
+                    target = {"search_backend": "backend", "search_api_key": "api_key",
+                              "searx_url": "searx_url"}[field]
+                    search[target] = value.strip() or None
             temporary = self.data_dir / (".web-settings-" + uuid.uuid4().hex + ".tmp")
             try:
                 temporary.write_text(json.dumps(candidate, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -119,15 +155,30 @@ class App:
             finally:
                 temporary.unlink(missing_ok=True)
             self._config, self._api_key = candidate, key
+            self._search_settings = search
             self.config_warning = ""
             if key:
                 self._secrets.add(key)
+            if search.get("api_key"):
+                self._secrets.add(search["api_key"])
             return {"config": self.public_config()}
+
+    def provider_ready(self):
+        """当前配置是否足以创建 provider（真实模型必须有 Key）。"""
+        with self._lock:
+            if self._config["provider"] == "demo":
+                return self.allow_demo
+            return bool(self._api_key)
 
     def _provider(self):
         with self._lock:
             if self._config["provider"] == "demo":
+                if not self.allow_demo:
+                    raise APIError(400, "演示模式已停用；请在设置中选择模型并填写 API Key")
                 return DemoProvider()
+            if not self._api_key:
+                raise APIError(400, "尚未配置 API Key：请在设置中填写并保存，"
+                                    "或设置环境变量 AGENTLAB_API_KEY 后重启服务")
             return OpenAICompatibleProvider(self._config["model"], self._api_key, self._config["base_url"])
 
     def _redact(self, value):
@@ -153,12 +204,19 @@ class App:
                             job["_session_ids"].add(row["session_id"])
                             break
         return Agent(self._provider(), tools=self.tools, store=self.store,
-                     workspace=self.workspace, on_event=event)
+                     workspace=self.workspace, on_event=event,
+                     tool_settings={"search": dict(self._search_settings)})
 
-    def submit(self, operation, session_id=None):
+    def submit(self, operation, session_id=None, require_provider=False):
         with self._lock:
             if self._closed:
                 raise APIError(503, "工作台正在关闭")
+            if require_provider and not self.provider_ready():
+                # 在提交阶段就拒绝，避免用户拿到一个必然失败的后台任务。
+                if self._config["provider"] == "demo":
+                    raise APIError(400, "演示模式已停用；请在设置中选择模型并填写 API Key")
+                raise APIError(400, "尚未配置 API Key：请在设置中填写并保存，"
+                                    "或设置环境变量 AGENTLAB_API_KEY 后重启服务")
             running = [job for job in self._jobs.values() if job["status"] == "running"]
             if len(running) >= self.MAX_ACTIVE_JOBS:
                 raise APIError(429, "后台任务已满，请等待任务结束")
@@ -339,7 +397,7 @@ class App:
                     raise APIError(400, "无效的会话 ID")
                 async def run(job):
                     return await self._agent(job).run(prompt, session_id)
-                return {"session_id": session_id, "job_id": self.submit(run, session_id)}
+                return {"session_id": session_id, "job_id": self.submit(run, session_id, require_provider=True)}
             match = re.fullmatch(r"/api/sessions/([A-Za-z0-9_-]{1,128})/(approve|recover)", path)
             if match:
                 session_id, action = match.groups()
@@ -352,14 +410,14 @@ class App:
                     raise APIError(400, "approved_call_ids 必须为调用 ID 列表，空列表表示全部拒绝")
                 async def approve(job):
                     return await self._agent(job).resume(session_id, ids)
-                return {"session_id": session_id, "job_id": self.submit(approve, session_id)}
+                return {"session_id": session_id, "job_id": self.submit(approve, session_id, require_provider=True)}
             if path == "/api/connection-test":
                 async def connection(job):
                     provider = self._provider()
                     response = await provider.complete([Message("user", "请只回复：连接成功")], [])
                     return {"content": response.content, "usage": {
                         "input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}}
-                return {"job_id": self.submit(connection)}
+                return {"job_id": self.submit(connection, require_provider=True)}
             if path == "/api/knowledge/import":
                 return self.import_files(payload)
             if path == "/api/knowledge/search":
@@ -376,7 +434,7 @@ class App:
                 from .cli import run_workflow
                 async def workflow(job):
                     return await run_workflow(self._agent(job))
-                return {"job_id": self.submit(workflow)}
+                return {"job_id": self.submit(workflow, require_provider=True)}
             if path == "/api/evaluate":
                 return {"job_id": self.submit(self._evaluate)}
         raise APIError(404, "未找到接口")

@@ -71,3 +71,52 @@ POSIX 文件操作使用 `dir_fd`、`O_NOFOLLOW` 和逐层目录描述符；工�
 计算器通过 AST 白名单解释数值表达式，没有 `eval`、函数调用、属性访问或变量。
 表达式最多 256 字符和 64 个 AST 节点，指数绝对值最多 100，数值幅度不超过
 `1e100`；这些边界用于防止简单的计算资源耗尽。
+
+## 联网工具与 SSRF 防护
+
+`web_search`、`fetch_url`、`http_request` 让 Agent 能获取外部信息。模型可以构造任意
+URL，因此 `netguard` 是这三者的共同安全出口：
+
+- **地址校验**：拒绝回环、私网、链路本地、组播、保留网段、CGNAT（100.64/10）与云元数据
+  （`169.254.169.254`、`fd00:ec2::254`）；IPv4-mapped IPv6（如 `::ffff:127.0.0.1`）按
+  IPv4 规则判断。DNS 解析出的**每一个**地址都必须通过检查，任一落在内网即整体拒绝。
+- **连接固定**：校验后的 IP 直接作为连接目标，Host 头与 TLS SNI 仍使用原主机名，
+  从而消除"先检查后连接"之间的 DNS 重绑定窗口。
+- **禁代理**：显式传入空的 `ProxyHandler`，避免流量经系统代理离开本机而使校验失效。
+- **不跟随重定向**：3xx 只把 `Location` 作为 `redirect_to` 返回，由调用方再次经过完整校验。
+- **限额**：响应体默认 2 MiB 上限、超时上限 120 秒，且拒绝 `Host`、`Content-Length`、
+  `Connection`、`Transfer-Encoding` 等由底层决定的请求头。
+
+`web_search` 默认使用免密钥的 DuckDuckGo HTML 端点；若页面改版会明确报错而不是静默返回空结果，
+此时可配置 API 后端：
+
+```bash
+export AGENTLAB_SEARCH_BACKEND=brave      # 或 tavily / searxng
+export AGENTLAB_SEARCH_API_KEY=...
+export AGENTLAB_SEARX_URL=https://searx.example.com   # 仅 searxng 需要
+```
+
+检索结果的链接同样会经过地址校验，指向内网的条目会被丢弃。**检索结果与网页正文是不可信输入**，
+工具返回值中带有相应提示，Agent 的系统提示也要求把它们当作数据而不是指令。
+
+## run_python：有界但非沙箱的代码执行
+
+`run_python` 把模型提供的代码放进独立子进程执行，用 `result` 变量回传数据，`stdout`/`stderr`
+一并捕获。它做了这些约束：
+
+| 约束 | 实现 |
+| --- | --- |
+| 超时 | `asyncio.wait_for` + 超时后终止**整个进程组**（`start_new_session` + `killpg`） |
+| 内存 | 父进程实时读取 RSS（macOS 用 `libproc.proc_pidinfo`，Linux 用 `/proc/<pid>/statm`），超限即杀；子进程另设 `RLIMIT_AS` 自保 |
+| CPU | `RLIMIT_CPU` 作为超时之外的第二道闸 |
+| 磁盘 | `RLIMIT_FSIZE` 限制单文件写入 |
+| 环境 | 只保留 `PATH`/`LANG`/`TZ` 等最小变量，`*_API_KEY` 与代理变量一律不传入 |
+| 解释器 | `python -I -B` 隔离模式，不读取 `PYTHONPATH` 与用户 site-packages |
+| 工作目录 | 默认工作区内临时目录，执行后删除 |
+
+**它不是安全沙箱**：子进程仍以当前用户身份运行，可读写文件系统、发起网络连接，因此
+`netguard` 的地址校验对它内部的 `socket` 调用无效。要执行真正不可信的代码，必须另加
+容器或 seccomp 级别的隔离。
+
+代码失败（异常、超时、内存超限）会**在工具层表现为 `ok: false`**，而不是嵌套在成功结果里，
+以免模型把"工具调用成功"误当成"代码执行成功"而继续编造结论。

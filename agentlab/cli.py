@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import json
+import os
 import shlex
 import sys
 import tempfile
@@ -16,7 +17,8 @@ from .tools import create_builtin_tools
 
 def parser():
     root = argparse.ArgumentParser(prog="agentlab", description="Agent Lab · 可阅读、可运行的 Python Agent 学习框架")
-    root.add_argument("--provider", choices=["demo", "openai"], default="demo", help="demo 离线演示；openai 兼容 API")
+    root.add_argument("--provider", choices=["openai", "demo"], default="openai",
+                      help="openai 兼容 API（默认，需配置模型与 Key）；demo 为离线规则演示，仅供观察框架行为")
     root.add_argument("--data-dir", default=".agentlab", help="SQLite 状态目录")
     root.add_argument("--workspace", default="workspace", help="工具可读写的唯一文件根目录")
     root.add_argument("--json", action="store_true", help="以 JSON 输出结果")
@@ -54,6 +56,17 @@ def parser():
 
 def emit(value):
     print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _tool_settings_from_env():
+    """从环境变量读取工具配置（当前用于检索后端凭据）。"""
+    settings = {}
+    backend = os.environ.get("AGENTLAB_SEARCH_BACKEND")
+    api_key = os.environ.get("AGENTLAB_SEARCH_API_KEY")
+    searx_url = os.environ.get("AGENTLAB_SEARX_URL")
+    if backend or api_key or searx_url:
+        settings["search"] = {"backend": backend, "api_key": api_key, "searx_url": searx_url}
+    return settings
 
 
 def show_result(result, as_json=False, args=None):
@@ -141,7 +154,8 @@ async def dispatch(args):
             print("[{}] {}".format(event["type"], json.dumps(event["data"], ensure_ascii=False)), file=sys.stderr)
         provider = provider_from_env(args.provider)
         agent = Agent(provider, store=store, workspace=args.workspace,
-                      config=AgentConfig(max_steps=args.max_steps), on_event=trace if args.verbose else None)
+                      config=AgentConfig(max_steps=args.max_steps), on_event=trace if args.verbose else None,
+                      tool_settings=_tool_settings_from_env())
         if args.command == "run":
             result = await agent.run(args.prompt, args.session)
         elif args.command == "approve":

@@ -1,47 +1,73 @@
-# Agent Lab · 从源码学习 Agent
+# Agent Lab · 可用的本地 Agent
 
-一套带本地浏览器界面的 Python Agent 学习框架。可以直接聊天、配置模型、查看工具过程、批准写入、导入知识库，再逐层阅读对应源码。Python **3.9+**，运行与测试均只需标准库。
+一套带本地浏览器界面的 Python Agent 框架。**默认使用真实模型**，用自然语言驱动 10 个内置工具完成检索、抓取、调用 API、执行代码与文件操作。Python **3.9+**，运行与测试只需标准库。
 
-默认使用离线规则模型，不需要 API Key；接入支持函数工具的 OpenAI 兼容 Chat Completions 服务后，可以执行自然语言任务。离线模式用于观察框架行为，本身没有大模型推理能力。
+填入 API Key 即可开始；离线规则演示模式仍然保留，但需要显式开启，仅用于观察框架行为。
 
-## 打开学习界面
-
-macOS 用户直接双击项目目录中的 **`启动 Agent Lab.command`**。程序会打开终端、启动本地服务，并在浏览器打开 [Agent Lab](http://127.0.0.1:8765/)。保留这个终端窗口即可继续使用；重复双击会复用已启动的 Agent Lab。关闭服务时，在该终端按 **Control+C**。
-
-打开后可以先用离线 Demo 发送 `/calc (20 + 1) * 2`，观察模型决策、计算器执行与最终回复。需要自然语言任务时，在界面设置中选择真实模型并填写 API 地址、模型名和 API Key。**通过界面输入的 Key 只保留在当前服务内存中；停止服务后需要重新填写。** 对话、知识库和非敏感设置保存在本机。
-
-也可以在项目目录运行：
+## 快速开始
 
 ```bash
-python3 -m agentlab serve --open
+# 1. 配置真实模型（任一 OpenAI 兼容服务）
+export AGENTLAB_API_KEY='你的密钥'
+export AGENTLAB_MODEL='deepseek-flash'                      # 换成支持函数工具的模型名
+export AGENTLAB_BASE_URL='https://api.deepseek.com'         # 换成你的服务地址
+
+# 2. 用自然语言提任务
+python3 -m agentlab run '搜索一下 Python 3.13 的新特性，然后用 Python 算一下它们的数量'
+
+# 3. 交互式多轮对话
+python3 -m agentlab chat --session work
 ```
 
-自定义端口使用 `python3 -m agentlab serve --port 9876 --open`。浏览器界面的完整说明见 [界面使用指南](docs/web-ui.md)。此服务只监听本机 `127.0.0.1`，不需要部署或注册网站。
+也可以在浏览器界面里配置：运行 `python3 -m agentlab serve --open`，在**设置**中填写模型、API 地址与 Key 并保存。**界面输入的 Key 只保留在服务内存中，停止服务后需重新填写。**
+
+## 内置工具（10 个）
+
+| 工具 | 作用 | 风险 |
+| --- | --- | --- |
+| `web_search` | 联网检索，返回标题/链接/摘要。默认免密钥后端，也可配 Brave / Tavily / SearXNG | 读 |
+| `fetch_url` | 抓取网页并转为纯文本，便于阅读正文 | 读 |
+| `http_request` | 调用外部 HTTP API，支持自定义方法与请求头 | 读 |
+| `run_python` | 在受限子进程中执行 Python，用 `result` 返回数据 | 读 |
+| `search_knowledge` | 检索本地知识库（中英文 BM25） | 读 |
+| `read_file` / `write_file` | 工作区内文件读写，写入需审批 | 读 / **写** |
+| `calculator` | AST 白名单数值计算，不使用 `eval` | 读 |
+| `remember` / `recall` | 会话级键值记忆，写入需审批 | **写** / 读 |
+
+所有联网请求都经过内置的 **SSRF 防护**：拒绝回环、私网、链路本地、CGNAT 与云元数据地址（含 IPv6 与映射地址），DNS 解析出的每个地址都要通过校验，并在校验后的 IP 上建立连接以消除重绑定窗口；默认不自动跟随重定向，`Host`/`Content-Length` 等请求头禁止模型覆盖。
+
+## 安全边界（请务必了解）
+
+- **`run_python` 不是沙箱。** 代码在独立子进程中以**当前用户身份**运行，仍可访问文件系统与网络。框架提供了超时（默认 20 秒）、内存上限（默认 1 GiB，macOS 用 `libproc` 实时 RSS 监控 + Linux 用 `/proc`）、进程组终止与环境变量净化（密钥不会传入子进程），但**不提供操作系统级隔离**。要执行不可信代码，请自行接入容器或 `seccomp`。
+- **SSRF 防护是应用层防线**，作用于工具调用路径；子进程内的 `socket` 不受其约束。
+- 工作目录限制、路径规范化（`O_NOFOLLOW` + `dir_fd`）是教学级防线，**不是**操作系统沙箱。
+- 检索结果、网页正文、API 响应都是**不可信输入**，Agent 会被告知把它们当作数据而不是指令。
+- 所有数据（会话、消息、知识库）以**明文**存在本机 SQLite；不要把真实凭据写进会话或知识文件。
 
 ## 从命令行观察框架
 
 以下命令均在 `agent-lab` 目录运行：
 
 ```bash
-# 先进入项目的 agent-lab 目录（克隆后即仓库根目录）
-cd agent-lab
-
-# 不需要 pip install，先观察完整的 model → tool → model 事件流
+# 观察完整的 model → tool → model 事件流
 python3 -m agentlab --verbose run '/calc (20 + 1) * 2'
+
+# 观察真实模型自主选择工具（需要已配置密钥）
+python3 -m agentlab run '计算 (126 + 78) * 3 并解释结果'
 
 # 导入随项目提供的中文知识库，再通过 Agent 检索
 python3 -m agentlab ingest knowledge
 python3 -m agentlab run '/search Agent 工具调用 记忆'
 
-# 启动多轮聊天（/quit 退出）
-python3 -m agentlab chat --session learning
+# 离线规则演示模式（不消耗 Token，仅用于观察框架）
+python3 -m agentlab --provider demo run '/calc (20 + 1) * 2'
 
 # 运行测试和离线评测
 python3 -m unittest discover -s tests -v
 python3 -m agentlab eval
 ```
 
-第一条运行命令应输出包含 `42` 的工具结果，状态为 `completed`，模型调用 2 次、工具调用 1 次。Demo 的 token 数显示为 0，因为没有真实模型请求。原有 CLI 和 Python 库入口可与浏览器界面并行用于学习。
+第一条运行命令应输出包含 `42` 的工具结果，状态为 `completed`。离线演示的 token 数显示为 0，因为没有真实模型请求。
 
 ## 已实现的功能
 

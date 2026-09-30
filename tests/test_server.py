@@ -20,7 +20,9 @@ class ServerTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.environment = patch.dict("os.environ", {"AGENTLAB_API_KEY": "", "AGENTLAB_MODEL": "deepseek-flash",
-                                                       "AGENTLAB_BASE_URL": "https://api.deepseek.com"})
+                                                       "AGENTLAB_BASE_URL": "https://api.deepseek.com",
+                                                       "AGENTLAB_ALLOW_DEMO": "1",
+                                                       "AGENTLAB_PROVIDER": "demo"})
         self.environment.start()
         self.app = App(self.root / "data", self.root / "work")
         self.addCleanup(self.app.close)

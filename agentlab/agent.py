@@ -69,7 +69,8 @@ class AgentResult:
 class Agent:
     def __init__(self, provider: Provider, tools: Optional[ToolRegistry] = None,
                  store: Optional[SQLiteStore] = None, workspace=Path("workspace"),
-                 config: Optional[AgentConfig] = None, on_event: Optional[Callable] = None):
+                 config: Optional[AgentConfig] = None, on_event: Optional[Callable] = None,
+                 tool_settings: Optional[Dict] = None):
         self.provider = provider
         self.tools = tools if tools is not None else create_builtin_tools()
         self.store = store if store is not None else SQLiteStore(":memory:")
@@ -77,6 +78,8 @@ class Agent:
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.config = config or AgentConfig()
         self.on_event = on_event
+        # 工具配置（如检索后端凭据）。它属于能力参数而非权限变更，故不计入执行环境指纹。
+        self.tool_settings = tool_settings if tool_settings is not None else {}
 
     def _identity(self):
         """审批与工作目录、模型端点、工具声明绑定，重启后不能悄悄更换执行环境。"""
@@ -245,7 +248,9 @@ class Agent:
                         self._save(state)
                         self._emit(state, "tool_started", name=call.name, call_id=call.id)
                         context = ToolContext(workspace=self.workspace, memory=self.store,
-                                              session_id=state["session_id"], max_output_chars=self.config.tool_output_chars)
+                                              session_id=state["session_id"],
+                                              max_output_chars=self.config.tool_output_chars,
+                                              settings=self.tool_settings)
                         result = await self.tools.execute(call, context, approved=state["decisions"].get(call.id, False))
                     state["messages"].append(Message("tool", json.dumps(result, ensure_ascii=False), tool_call_id=call.id).to_dict())
                     state["tool_count"] += 1

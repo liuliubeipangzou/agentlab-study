@@ -162,19 +162,30 @@ class CLIIntegrationTests(unittest.TestCase):
 
     def test_tools_command_lists_callable_contracts(self):
         tools = self.invoke("tools")
-        self.assertEqual({tool["function"]["name"] for tool in tools},
-                         {"calculator", "read_file", "write_file", "search_knowledge", "remember", "recall"})
+        names = {tool["function"]["name"] for tool in tools}
+        # 基础能力与联网/执行能力都必须暴露给模型。
+        self.assertLessEqual({"calculator", "read_file", "write_file", "search_knowledge",
+                              "remember", "recall"}, names)
+        self.assertLessEqual({"web_search", "fetch_url", "http_request", "run_python"}, names)
         for tool in tools:
             self.assertEqual(tool["type"], "function")
             self.assertEqual(tool["function"]["parameters"]["type"], "object")
+            self.assertTrue(tool["function"]["description"])
 
     def test_missing_live_configuration_fails_locally_without_traceback(self):
         process = self.invoke("run", "hello", provider="openai", expected=2)
         self.assertIn("AGENTLAB_MODEL", process.stderr)
         self.assertNotIn("Traceback", process.stderr)
         self.assertEqual(process.stdout, "")
-        # The same clean environment still runs the default offline model.
-        self.assertEqual(self.invoke("run", "/calc 7*8")["status"], "completed")
+        # 离线演示模型仍然可用，但需要显式选择：真实模型已是默认路径。
+        self.assertEqual(self.invoke("run", "/calc 7*8", provider="demo")["status"], "completed")
+        # 默认 provider 在没有凭据时必须给出可读错误，而不是静默降级为演示模式。
+        process = self.invoke("run", "hello", provider="openai", expected=2)
+        # 校验顺序为先模型名、后 API Key，两者都缺失时报出前者即可。
+        self.assertTrue("AGENTLAB_API_KEY" in process.stderr or "AGENTLAB_MODEL" in process.stderr,
+                        process.stderr)
+        self.assertNotIn("Traceback", process.stderr)
+        self.assertNotIn("离线 Demo", process.stdout)
 
 
 if __name__ == "__main__":
