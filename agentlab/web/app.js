@@ -135,7 +135,7 @@ function currentJob() { return [...state.jobs.values()].find(job => job.kind ===
 function running() { return state.sending || Boolean(currentJob()) || Boolean(state.current && state.current.active); }
 function pending() { return state.current && state.current.status === "waiting_approval"; }
 function recovery() { return Boolean(state.current && state.current.status === "running" && !state.current.active && !currentJob() && !state.sending); }
-function writeCall(call) { const definition = state.tools.find(tool => (tool.function || tool).name === call.name); return definition && definition.risk ? definition.risk === "write" : ["write_file", "remember"].includes(call.name); }
+function writeCall(call) { if (typeof call.needs_approval === "boolean") return call.needs_approval; const definition = state.tools.find(tool => (tool.function || tool).name === call.name); return definition && definition.risk ? definition.risk === "write" : ["write_file", "remember"].includes(call.name); }
 function callMap(messages) { const map = new Map(); messages.forEach(message => (message.tool_calls || []).forEach(call => map.set(call.id, call))); return map; }
 function readableValue(value, host, toolName) {
   if (typeof value === "number") { host.append(el("p", "answer-result", "计算结果：" + value)); return; }

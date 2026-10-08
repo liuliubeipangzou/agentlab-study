@@ -122,6 +122,30 @@ class ServerTests(unittest.TestCase):
                               {"approved_call_ids": ids})[1]
         self.assertEqual(self.wait_job(replay["job_id"])["status"], "failed")
 
+    def test_conditional_approval_is_flagged_by_server_for_ui(self):
+        """http_request 的 POST 风险级别是 read，但需要审批；前端必须能据此显示勾选框并批准。"""
+        from agentlab.providers import ScriptedProvider
+        provider = ScriptedProvider([ModelResponse("", [
+            ToolCall("http_request", {"url": "https://example.com/", "method": "GET"}, "get1"),
+            ToolCall("http_request", {"url": "https://example.com/", "method": "POST", "body": "x"}, "post1")])])
+        with patch.object(self.app, "_provider", return_value=provider):
+            submitted = self.request("POST", "/api/run", {"prompt": "call api", "session_id": "cond"})[1]
+            job = self.wait_job(submitted["job_id"])
+        self.assertEqual(job["result"]["status"], "waiting_approval", job["result"])
+        state = self.request("GET", "/api/sessions/cond")[1]
+        flags = {call["id"]: call["needs_approval"] for call in state["pending"]}
+        self.assertEqual(flags, {"get1": False, "post1": True})
+        definition = next(x for x in self.request("GET", "/api/bootstrap")[1]["tools"]
+                          if x["function"]["name"] == "http_request")
+        self.assertEqual(definition["risk"], "read")
+
+    def test_delete_session_via_api(self):
+        submitted = self.request("POST", "/api/run", {"prompt": "/calc 1 + 1", "session_id": "gone"})[1]
+        self.wait_job(submitted["job_id"])
+        self.assertEqual(self.request("POST", "/api/sessions/gone/delete")[1], {"deleted": "gone"})
+        self.assertEqual(self.request("GET", "/api/sessions/gone")[0], 404)
+        self.assertEqual(self.request("POST", "/api/sessions/gone/delete")[0], 404)
+
     def test_config_key_is_memory_only_and_configuration_makes_no_model_request(self):
         key = "sk-fake-server-test-secret"
         with patch("agentlab.server.OpenAICompatibleProvider.complete", new_callable=AsyncMock) as complete:

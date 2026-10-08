@@ -42,7 +42,8 @@ def parser():
     selection.add_argument("--all", action="store_true", help="批准当前检查点的全部写入")
     selection.add_argument("--call", action="append", default=[], help="批准指定调用 ID，可重复")
     for name, help_text in [("deny", "拒绝待审批操作并继续"), ("inspect", "查看会话检查点"),
-                            ("trace", "查看事件轨迹"), ("recover", "结束中断的运行，不重放工具")]:
+                            ("trace", "查看事件轨迹"), ("recover", "结束中断的运行，不重放工具"),
+                            ("delete", "删除会话及其事件与记忆")]:
         command = sub.add_parser(name, help=help_text)
         command.add_argument("session")
     sub.add_parser("sessions", help="列出持久化会话")
@@ -205,6 +206,10 @@ async def dispatch(args):
             result = await agent.resume(args.session, [], on_delta=on_delta)
         elif args.command == "recover":
             result = agent.recover(args.session)
+        elif args.command == "delete":
+            agent.delete(args.session)
+            emit({"deleted": args.session})
+            return 0
         elif args.command == "workflow":
             report = await run_workflow(agent)
             emit(report)

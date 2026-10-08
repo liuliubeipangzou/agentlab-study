@@ -137,6 +137,38 @@ class AgentStateReviewTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.store.acquire_session("identity", "test-owner"))
         self.store.release_session("identity", "test-owner")
 
+    async def test_changed_tool_set_denies_pending_instead_of_stranding_session(self):
+        agent = self.make_agent([ModelResponse(tool_calls=[ToolCall("write", {"value": "pending"}, id="pending")])])
+        await agent.run("write", "tools-changed")
+        # 升级后工具定义变化（这里新增一个工具）：旧审批不能套用到新定义上。
+        async def extra(arguments, context):
+            return "extra"
+        self.tools.register(Tool("extra", "a newly added tool",
+            {"type": "object", "properties": {}, "additionalProperties": False}, extra))
+        restarted = self.make_agent([ModelResponse("done after denial")])
+        # 即使调用方传入了批准，也必须按拒绝处理。
+        result = await restarted.resume("tools-changed", ["pending"])
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(self.writes, [])
+        state = self.store.load_session("tools-changed")
+        denial = next(m for m in state["messages"] if m["role"] == "tool")
+        self.assertIn("工具集在等待审批期间发生变化", denial["content"])
+        self.assertEqual(state["execution"], restarted._identity())
+        self.assertIn("tools_changed", [e["type"] for e in self.store.events("tools-changed")])
+
+    async def test_delete_session_removes_data_but_not_while_running(self):
+        agent = self.make_agent([ModelResponse("hi")])
+        await agent.run("hello", "doomed")
+        self.assertTrue(self.store.acquire_session("doomed", "other-owner"))
+        with self.assertRaises(SessionError):
+            agent.delete("doomed")
+        self.store.release_session("doomed", "other-owner")
+        agent.delete("doomed")
+        self.assertIsNone(self.store.load_session("doomed"))
+        self.assertEqual(self.store.events("doomed"), [])
+        with self.assertRaises(SessionError):
+            agent.delete("doomed")
+
     async def test_changed_provider_model_rejects_resume(self):
         agent = self.make_agent([ModelResponse(tool_calls=[ToolCall("write", {"value": "pending"}, id="pending")])])
         agent.provider.model = "original-model"

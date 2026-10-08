@@ -1,6 +1,6 @@
 # Agent Lab · 可用的本地 Agent
 
-一套带本地浏览器界面的 Python Agent 框架。**默认使用真实模型**，用自然语言驱动 10 个内置工具完成检索、抓取、调用 API、执行代码与文件操作。Python **3.9+**，运行与测试只需标准库。
+一套带本地浏览器界面的 Python Agent 框架。**默认使用真实模型**，用自然语言驱动 12 个内置工具完成检索、抓取、调用 API、执行代码与文件操作。Python **3.9+**，运行与测试只需标准库。
 
 填入 API Key 即可开始；离线规则演示模式仍然保留，但需要显式开启，仅用于观察框架行为。
 
@@ -28,16 +28,16 @@ index 对齐重组，经完整校验后才执行，不会执行半截参数。�
 
 也可以在浏览器界面里配置：运行 `python3 -m agentlab serve --open`，在**设置**中填写模型、API 地址与 Key 并保存。**界面输入的 Key 只保留在服务内存中，停止服务后需重新填写。**
 
-## 内置工具（11 个）
+## 内置工具（12 个）
 
 | 工具 | 作用 | 风险 |
 | --- | --- | --- |
 | `web_search` | 联网检索，返回标题/链接/摘要。默认免密钥后端，也可配 Brave / Tavily / SearXNG | 读 |
 | `fetch_url` | 抓取网页并转为纯文本，便于阅读正文 | 读 |
-| `http_request` | 调用外部 HTTP API，支持自定义方法与请求头 | 读 |
-| `run_python` | 在受限子进程中执行 Python，用 `result` 返回数据 | 读 |
+| `http_request` | 调用外部 HTTP API，支持自定义方法与请求头 | 读（POST/PUT/PATCH/DELETE 需审批） |
+| `run_python` | 在受限子进程中执行 Python，用 `result` 返回数据 | **写**（需审批） |
 | `search_knowledge` | 检索本地知识库（中英文 BM25） | 读 |
-| `read_file` / `write_file` | 工作区内文件读写，写入需审批 | 读 / **写** |
+| `read_file` / `list_files` / `write_file` | 工作区内文件读取、列目录与写入，写入需审批 | 读 / 读 / **写** |
 | `calculator` | AST 白名单数值计算，不使用 `eval` | 读 |
 | `remember` / `recall` | 会话级键值记忆，写入需审批 | **写** / 读 |
 | `search_memory` | **跨会话**长期记忆检索（BM25 + IDF 排序） | 读 |

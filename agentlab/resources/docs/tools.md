@@ -112,7 +112,7 @@ export AGENTLAB_SEARX_URL=https://searx.example.com   # 仅 searxng 需要
 | 磁盘 | `RLIMIT_FSIZE` 限制单文件写入 |
 | 环境 | 只保留 `PATH`/`LANG`/`TZ` 等最小变量，`*_API_KEY` 与代理变量一律不传入 |
 | 解释器 | `python -I -B` 隔离模式，不读取 `PYTHONPATH` 与用户 site-packages |
-| 工作目录 | 默认工作区内临时目录，执行后删除 |
+| 工作目录 | `run_python` 工具以工作区根目录为工作目录，写出的文件会保留；直接调用 `pysandbox.run_python` 且不传 `cwd` 时才使用执行后删除的临时目录 |
 
 **它不是安全沙箱**：子进程仍以当前用户身份运行，可读写文件系统、发起网络连接，因此
 `netguard` 的地址校验对它内部的 `socket` 调用无效。要执行真正不可信的代码，必须另加

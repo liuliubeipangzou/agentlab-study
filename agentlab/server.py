@@ -29,7 +29,7 @@ from .tools import create_builtin_tools
 from .workspace_files import import_files as upload_workspace_files
 from .workspace_files import list_workspace as list_workspace_files
 from .workspace_files import read_file as read_workspace_file
-from .types import Message
+from .types import Message, ToolCall
 
 
 PACKAGE = Path(__file__).resolve().parent
@@ -406,7 +406,18 @@ class App:
             active_job_id = next((job["job_id"] for job in self._jobs.values()
                 if job["status"] == "running" and (job.get("session_id") == session_id
                     or session_id in job["_session_ids"])), None)
-        return dict(state, events=self.store.events(session_id), memory=self.store.recall(session_id),
+        # 由服务端判定每个待处理调用是否需要审批：条件审批工具（如 POST 的 http_request）
+        # 的风险级别是 read，前端只看 risk 会漏掉勾选框，导致调用永远被拒绝。
+        pending = []
+        for raw in state.get("pending", []):
+            item = dict(raw)
+            try:
+                item["needs_approval"] = self.tools.requires_approval(ToolCall.from_dict(raw))
+            except Exception:
+                item["needs_approval"] = True
+            pending.append(item)
+        return dict(state, pending=pending, events=self.store.events(session_id),
+                    memory=self.store.recall(session_id),
                     active=active_job_id is not None, active_job_id=active_job_id)
 
     async def _evaluate(self, job):
@@ -537,10 +548,22 @@ class App:
                     agent = self._agent(job)
                     return await agent.run(prompt, session_id, on_delta=self._delta_handler(job))
                 return {"session_id": session_id, "job_id": self.submit(run, session_id, require_provider=True)}
-            match = re.fullmatch(r"/api/sessions/([A-Za-z0-9_-]{1,128})/(approve|recover)", path)
+            match = re.fullmatch(r"/api/sessions/([A-Za-z0-9_-]{1,128})/(approve|recover|delete)", path)
             if match:
                 session_id, action = match.groups()
                 self._session(session_id)
+                if action == "delete":
+                    with self._lock:
+                        busy = any(job["status"] == "running" and (job.get("session_id") == session_id
+                                   or session_id in job["_session_ids"]) for job in self._jobs.values())
+                    if busy:
+                        raise APIError(409, "会话正在运行，请先停止后再删除")
+                    try:
+                        Agent(DemoProvider(), tools=self.tools, store=self.store,
+                              workspace=self.workspace).delete(session_id)
+                    except SessionError as exc:
+                        raise APIError(409, str(exc)) from None
+                    return {"deleted": session_id}
                 if action == "recover":
                     return Agent(DemoProvider(), tools=self.tools, store=self.store,
                                  workspace=self.workspace).recover(session_id).to_dict()

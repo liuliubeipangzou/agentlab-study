@@ -4,7 +4,7 @@
 
 - 子进程 + 进程组，超时后杀掉整组，避免残留后台进程；
 - `-I` 隔离模式：忽略 PYTHONPATH 与环境变量对 sys.path 的注入，不读取用户 site-packages；
-- 工作目录固定为一个工作区内的临时目录，结束后删除；
+- 未指定 cwd 时使用临时目录并在结束后删除；`run_python` 工具会传入工作区根目录，写出的文件会保留；
 - 内存与 CPU 使用 `resource.setrlimit` 硬限制（RLIMIT_CPU 在 macOS/Linux 上可靠触发）；
 - 环境变量只保留最小集合，密钥不会进入子进程；
 - 结果通过专用文件描述符回传，stdout/stderr 并发有界捕获。

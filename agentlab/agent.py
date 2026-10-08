@@ -97,11 +97,12 @@ class Agent:
                              "base_url": getattr(self.provider, "base_url", None)},
                 "tools": tools}
 
-    def _check_identity(self, state):
+    def _check_identity(self, state, allow_tool_change=False):
+        """校验执行环境。返回 True 表示仅工具集变化且调用方允许降级处理。"""
         current = self._identity()
         recorded = state.get("execution")
         if recorded == current:
-            return
+            return False
         # 逐项比较并给出可操作的差异说明。只报"不一致"会让用户无从下手，
         # 尤其是升级导致工具指纹格式变化、使旧检查点失效的情况。
         if isinstance(recorded, dict) and recorded.get("workspace") != current["workspace"]:
@@ -113,10 +114,14 @@ class Agent:
                 "模型端点与检查点不一致（检查点 %s，当前 %s）。请用原来的 provider、模型名与 base_url 恢复。"
                 % (recorded.get("provider"), current["provider"]))
         if isinstance(recorded, dict) and recorded.get("tools") != current["tools"]:
+            if allow_tool_change:
+                # 旧审批是针对旧工具定义给出的，不能套用到变化后的工具上；
+                # 调用方应拒绝全部待审批操作，让会话得以继续而不是永久卡死。
+                return True
             raise SessionError(
                 "工具集与检查点不一致（工具定义、风险级别或审批策略已变化）。"
-                "这通常发生在升级或改动工具注册表之后：旧检查点的待审批操作无法复用，"
-                "请执行 recover 结束该轮，然后重新发起任务。")
+                "这通常发生在升级或改动工具注册表之后：旧检查点的待审批操作无法复用。"
+                "请使用 deny 拒绝待审批操作后继续，或删除该会话。")
         raise SessionError("执行环境与检查点不一致；请使用原 provider、workspace 和工具注册表恢复会话")
 
     def _save(self, state):
@@ -202,14 +207,21 @@ class Agent:
             state = self.store.load_session(session_id)
             if not state or state["status"] != "waiting_approval":
                 raise SessionError("该会话没有待审批操作")
-            self._check_identity(state)
+            tools_changed = self._check_identity(state, allow_tool_change=True)
             pending_ids = {x["id"] for x in state["pending"] if self.tools.requires_approval(ToolCall.from_dict(x))}
             approved = set(approved_call_ids or [])
-            if not approved <= pending_ids:
+            if tools_changed:
+                approved = set()
+                state["denied_reason"] = {call_id: "工具集在等待审批期间发生变化，该操作已被自动取消；"
+                                                   "如仍需要，请重新发起并重新审批。" for call_id in pending_ids}
+                state["execution"] = self._identity()
+            elif not approved <= pending_ids:
                 raise ValueError("批准列表含有未知调用 ID")
             state["decisions"] = {call_id: call_id in approved for call_id in pending_ids}
             state["status"] = "running"
             self._save(state)
+            if tools_changed:
+                self._emit(state, "tools_changed", denied=sorted(pending_ids))
             self._emit(state, "approval_resolved", approved=list(approved), denied=sorted(pending_ids - approved))
             return await self._guarded_loop(state, on_delta)
         finally:
@@ -227,6 +239,18 @@ class Agent:
             reason = "运行中断，未重放工具；执行中的工具结果未知，请先检查可能发生的副作用。"
             self._close_pending(state, reason)
             return self._finish(state, "failed", reason)
+        finally:
+            self.store.release_session(session_id, owner)
+
+    def delete(self, session_id: str) -> None:
+        """删除会话及其事件与记忆。先取得租约，避免删掉仍在运行的会话。"""
+        owner = uuid.uuid4().hex
+        if not self.store.acquire_session(session_id, owner, ttl=30):
+            raise SessionError("会话正在运行，请先停止后再删除")
+        try:
+            if self.store.load_session(session_id) is None:
+                raise SessionError("未找到会话：" + session_id)
+            self.store.delete_session(session_id)
         finally:
             self.store.release_session(session_id, owner)
 
@@ -281,7 +305,8 @@ class Agent:
                     raw = state["pending"][0]
                     call = ToolCall.from_dict(raw)
                     if self.tools.requires_approval(call) and not state["decisions"].get(call.id, False):
-                        result = {"ok": False, "error": "用户拒绝了该操作，请勿绕过审批"}
+                        reason = state.get("denied_reason", {}).pop(call.id, None)
+                        result = {"ok": False, "error": reason or "用户拒绝了该操作，请勿绕过审批"}
                     else:
                         state["in_flight"] = call.id
                         self._save(state)

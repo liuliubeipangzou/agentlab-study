@@ -1,10 +1,10 @@
 # 验证记录
 
-验证日期：2026-09-30。环境：macOS、Python 3.9.6、Node.js。Python 测试使用标准库，前端状态测试使用 Node 内置测试器，无第三方测试依赖，无付费模型调用。
+验证日期：2026-10-08。环境：macOS、Python 3.9.6、Node.js。Python 测试使用标准库，前端状态测试使用 Node 内置测试器，无第三方测试依赖，无付费模型调用。
 
 | 检查 | 结果 |
 | --- | --- |
-| `python3 -m unittest discover -s tests -q` | 138 项通过 |
+| `python3 -m unittest discover -s tests -q` | 295 项通过 |
 | `node --test tests/web-state.test.cjs` | 3 项通过 |
 | `node --check agentlab/web/app.js` | 通过 |
 | `python3 -m examples.basic` | 通过，2 次模型调用、1 次工具调用、结果 42 |
