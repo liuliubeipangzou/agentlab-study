@@ -69,9 +69,9 @@ from agentlab.providers import OpenAICompatibleProvider
 provider = OpenAICompatibleProvider(
     model="your-model",
     api_key="从环境读取的密钥",
-    timeout=30,
-    max_retries=2,
-    max_output_tokens=2048,
+    timeout=120,
+    max_retries=4,
+    max_output_tokens=8192,
 )
 ```
 
@@ -82,10 +82,15 @@ provider = OpenAICompatibleProvider(
 
 ## 错误、超时与重试
 
-连接错误、HTTP 429 和 5xx 最多重试 `max_retries` 次，默认 2 次，因此最多发出
-3 次请求。每次退避从 0.25 秒开始翻倍，并参考数值形式的 `Retry-After`，等待上限
-为 5 秒；401、403、其他 4xx、重定向和无效响应不重试。API 异常只显示经过处理的
+连接错误、HTTP 429 和 5xx 最多重试 `max_retries` 次，默认 4 次，因此最多发出
+5 次请求。每次退避从 1 秒开始翻倍，并参考数值形式的 `Retry-After`，单次等待上限
+为 30 秒；401、403、其他 4xx、重定向不在适配器内重试。API 异常只显示经过处理的
 类别和状态码，不透出密钥、远端响应正文或异常地址。
+
+模型返回了无法使用的内容（工具参数不是合法 JSON、响应结构无效、空响应、因 `length`
+被截断）时，适配器抛出 `ModelFormatError`（`ProviderError` 的子类）。这类错误换一次生成
+往往就能恢复，所以由 Agent 带着一条只用于重试的纠正提示重新请求，最多 `format_retries`
+次，不会让整次运行直接失败；超过次数后才按失败处理。
 
 请求在 `asyncio.to_thread` 中运行，避免阻塞 Agent 的事件循环。`timeout` 是底层
 网络 I/O 超时，并非整轮任务的总时限：协程取消后，已启动的线程仍可能等待到

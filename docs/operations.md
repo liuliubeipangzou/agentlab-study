@@ -4,13 +4,16 @@
 
 | 参数 | 默认值 | 语义 |
 | --- | ---: | --- |
-| max_steps | 8 | 每个用户任务的最大模型调用数，审批恢复不重置 |
-| max_tool_calls | 16 | 每个任务的工具调用预算，包括用户拒绝的调用 |
-| max_context_chars | 24000 | system 文本与序列化消息的字符上限，不含工具 schema |
-| max_total_tokens | 20000 | API 已报告 usage 的累计上限 |
-| run_timeout | 120 秒 | 同一任务累计推进时间，审批等待不计入 |
-| tool_output_chars | 8000 | 序列化工具 value 的长度上限，最低 128 |
-| system_prompt | 中文助手提示 | 可替换的应用行为描述 |
+| max_steps | 40 | 每个用户任务的最大模型调用数，审批恢复不重置 |
+| max_tool_calls | 100 | 每个任务的工具调用预算，包括用户拒绝的调用 |
+| max_context_chars | 96000 | system 文本与序列化消息的字符上限，不含工具 schema；超出时先把较早的轮次摘要进系统提示 |
+| max_total_tokens | 2000000 | API 已报告 usage 的累计上限 |
+| run_timeout | 900 秒 | 同一任务累计推进时间，审批等待不计入 |
+| tool_output_chars | 16000 | 序列化工具 value 的长度上限，最低 128 |
+| format_retries | 2 | 模型返回非法工具参数、空响应或被截断时，带纠正提示重试的次数；纠正提示不写入历史 |
+| summarize_history | True | 上下文超限时用模型把较早的轮次压缩成滚动摘要（完整历史仍保存在会话里）；摘要失败则退回到整轮裁剪 |
+| wrap_up | True | 步数、token 或工具次数触顶时，再发一次不带工具的调用让模型交代进展，会话可回复“继续”接着做；该调用允许略微超出预算 |
+| system_prompt | 中文工作助手提示 | 可替换的应用行为描述；每次调用会附上当前日期和历史摘要 |
 
 token 预算在响应后累计，达到限制便停止继续调用。它不是严格费用封顶：单次请求可能越过预算，重试也可能计费；未返回 usage 的兼容服务按 0 记录。若要更紧的控制，请同时设置 Provider 的 `max_output_tokens`、`max_retries` 和 Agent 步数。
 
@@ -19,6 +22,13 @@ from agentlab import AgentConfig
 
 config = AgentConfig(max_steps=5, max_tool_calls=8, run_timeout=60,
                      max_context_chars=16000, tool_output_chars=4000)
+```
+
+命令行可用 `--max-steps`、`--max-tool-calls`、`--max-tokens`、`--timeout` 覆盖对应预算；浏览器界面在“设置 → 运行预算”里配置，留空即使用默认值。
+
+```python
+# 需要旧版（演示级）的紧预算时：
+config = AgentConfig(max_steps=8, max_tool_calls=16, max_total_tokens=20000, run_timeout=120)
 ```
 
 ## 支持范围

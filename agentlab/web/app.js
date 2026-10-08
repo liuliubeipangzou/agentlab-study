@@ -100,6 +100,7 @@ function applyConfig(config) {
   $("#api-key-status").textContent = config.has_api_key ? "本次启动已设置" : "未设置"; $("#settings-saved-status").textContent = "已保存 · " + (demo ? "演示模式" : "真实模型");
   $("#config-provider").value = config.provider || "openai"; $("#config-model").value = config.model || "deepseek-flash"; $("#config-base-url").value = config.base_url || "https://api.deepseek.com";
   if (config.streaming !== undefined) { const streaming = $("#config-streaming"); if (streaming) streaming.checked = config.streaming !== false; }
+  ["max_steps", "max_tool_calls", "max_total_tokens", "run_timeout"].forEach(name => { const input = $("#budget-" + name); if (!input) return; const saved = (config.budgets || {})[name]; input.value = saved === undefined ? "" : String(saved); const fallback = (config.budget_defaults || {})[name]; input.placeholder = fallback === undefined ? "默认" : "默认 " + fallback; });
   if (config.search_backend !== undefined) $("#config-search-backend").value = config.search_backend || "";
   if (config.has_search_key !== undefined) $("#search-key-status").textContent = config.has_search_key ? "已设置" : "(可选，留空使用免密钥后端)";
   if (needsKey && state.view === "chat") { const keyField = $("#config-api-key"); if (keyField && !keyField.value) keyField.placeholder = "在此粘贴 API Key 后保存"; }
@@ -174,7 +175,12 @@ function renderChat() {
   }
   const active = running(), waiting = pending(), interrupted = recovery(), host = $("#run-state"); host.classList.remove("error");
   if (active) { host.replaceChildren(el("span", "loading-dot"), document.createTextNode("Agent 正在处理任务，右侧可查看执行进展…")); show(host, true); }
-  else if (session && ["failed", "limited", "cancelled"].includes(session.status)) { host.textContent = session.output || statuses[session.status]; host.classList.toggle("error", session.status === "failed"); show(host, true); }
+  else if (session && ["failed", "limited", "cancelled"].includes(session.status)) {
+    host.textContent = session.output || statuses[session.status]; host.classList.toggle("error", session.status === "failed");
+    // 触顶后会话仍可继续：一键发送“继续”，Agent 会基于已保存的历史接着做。
+    if (session.status === "limited") host.append(document.createTextNode(" "), button("继续", "button secondary", guarded(() => { $("#prompt").value = "继续"; return sendPrompt(); })));
+    show(host, true);
+  }
   else if (state.chatNotice) { host.textContent = state.chatNotice; host.classList.add("error"); show(host, true); }
   else show(host, false);
   renderApproval(); renderRecovery();
@@ -388,6 +394,7 @@ async function saveSettings(event) {
   if (searchKey && searchKey.value.trim()) payload.search_api_key = searchKey.value.trim();
   if (searxUrl) payload.searx_url = searxUrl.value.trim();
   const streaming = $("#config-streaming"); if (streaming) payload.streaming = streaming.checked;
+  payload.budgets = {}; ["max_steps", "max_tool_calls", "max_total_tokens", "run_timeout"].forEach(name => { const input = $("#budget-" + name); if (input && input.value.trim()) payload.budgets[name] = Number(input.value); });
   const clearKey = $("#clear-api-key"); if (clearKey && clearKey.checked) payload.api_key = "";
   const clearSearchKey = $("#clear-search-key"); if (clearSearchKey && clearSearchKey.checked) payload.search_api_key = "";
   busy($("#save-settings"), true);

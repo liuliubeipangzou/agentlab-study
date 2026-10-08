@@ -157,7 +157,7 @@ class APIProviderTests(unittest.IsolatedAsyncioTestCase):
             response = await self.provider.complete([Message("user", "hi")], [])
         self.assertEqual(response.content, "你好")
         self.assertEqual(opener.open.call_count, 3)
-        self.assertEqual([c.args[0] for c in sleep.call_args_list], [5.0, 0.5])
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [30.0, 2.0])
 
     async def test_retry_exhaustion_is_bounded_and_sanitized(self):
         opener = MagicMock()
@@ -192,7 +192,7 @@ class APIProviderTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(request.full_url, "https://api.openai.com/v1/chat/completions")
                 self.assertEqual(request.get_header("Authorization"), "Bearer secret-test-key")
                 self.assertEqual(request.get_method(), "POST")
-                self.assertEqual(opener.open.call_args.kwargs["timeout"], 30)
+                self.assertEqual(opener.open.call_args.kwargs["timeout"], 120)
 
     async def test_response_size_limit(self):
         opener = MagicMock()

@@ -139,6 +139,27 @@ class ServerTests(unittest.TestCase):
                           if x["function"]["name"] == "http_request")
         self.assertEqual(definition["risk"], "read")
 
+    def test_budgets_are_validated_persisted_and_applied_to_agents(self):
+        defaults = self.request("GET", "/api/bootstrap")[1]["config"]
+        self.assertEqual(defaults["budgets"], {})
+        self.assertGreater(defaults["budget_defaults"]["max_steps"], 8)
+        for bad in ({"max_steps": 0}, {"max_steps": True}, {"max_steps": 1.5}, {"nope": 1},
+                    {"run_timeout": 1}, {"max_steps": "9"}):
+            self.assertEqual(self.request("POST", "/api/config", {"budgets": bad})[0], 400, bad)
+        self.assertEqual(self.request("POST", "/api/config", {"budgets": []})[0], 400)
+        status, saved, _ = self.request("POST", "/api/config", {"budgets": {"max_steps": 7, "run_timeout": 60}})
+        self.assertEqual(status, 200)
+        self.assertEqual(saved["config"]["budgets"], {"max_steps": 7, "run_timeout": 60.0})
+        self.assertEqual(json.loads((self.root / "data" / "web-settings.json").read_text())["budgets"],
+                         {"max_steps": 7, "run_timeout": 60.0})
+        agent = self.app._agent({"events": [], "_session_ids": set()})
+        self.assertEqual((agent.config.max_steps, agent.config.run_timeout), (7, 60.0))
+        # 不带 budgets 的保存不会清掉已有预算；空对象才恢复默认。
+        self.request("POST", "/api/config", {"model": "other-model"})
+        self.assertEqual(self.app.public_config()["budgets"]["max_steps"], 7)
+        self.request("POST", "/api/config", {"budgets": {}})
+        self.assertEqual(self.app.public_config()["budgets"], {})
+
     def test_delete_session_via_api(self):
         submitted = self.request("POST", "/api/run", {"prompt": "/calc 1 + 1", "session_id": "gone"})[1]
         self.wait_job(submitted["job_id"])

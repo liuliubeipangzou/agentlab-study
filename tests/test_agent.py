@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from agentlab.agent import Agent, AgentConfig, SessionError
-from agentlab.providers import ScriptedProvider
+from agentlab.providers import ModelFormatError, ScriptedProvider
 from agentlab.storage import SQLiteStore
 from agentlab.tools import Tool, ToolRegistry
 from agentlab.types import ModelResponse, ToolCall, Usage
@@ -159,14 +159,109 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_full_turn_context_trimming(self):
         agent = self.agent([ModelResponse("a" * 300), ModelResponse("done")],
-                           config=AgentConfig(system_prompt="system", max_context_chars=500))
+                           config=AgentConfig(system_prompt="system", max_context_chars=500,
+                                                summarize_history=False))
         await agent.run("first", "trim")
         await agent.run("second" * 20, "trim")
         # Provider receives only complete turns; persisted history remains complete.
         self.assertEqual(len(self.store.load_session("trim")["messages"]), 4)
 
+    async def test_step_limit_gets_wrap_up_turn_without_tools(self):
+        agent = self.agent([ModelResponse(tool_calls=[ToolCall("calculator", {"expression": "1+1"})]),
+                            ModelResponse("已算出 2，其余未做。")], config=AgentConfig(max_steps=1))
+        result = await agent.run("loop", "wrap")
+        self.assertEqual(result.status, "limited")
+        self.assertIn("达到模型调用步数上限", result.output)
+        self.assertIn("已算出 2", result.output)
+        # 收尾调用不带工具，且提示里要求总结；总结作为 assistant 消息保留，便于用户回复“继续”。
+        last = agent.provider.calls[-1]
+        self.assertEqual(last["tools"], [])
+        self.assertIn("不要再调用任何工具", last["messages"][-1].content)
+        self.assertEqual(self.store.load_session("wrap")["messages"][-1]["content"], "已算出 2，其余未做。")
+        follow = await agent.run("继续", "wrap")
+        self.assertEqual(follow.status, "failed")  # 脚本已耗尽；说明可以在同一会话继续运行
+
+    async def test_wrap_up_can_be_disabled(self):
+        agent = self.agent([ModelResponse(tool_calls=[ToolCall("calculator", {"expression": "1+1"})])],
+                           config=AgentConfig(max_steps=1, wrap_up=False))
+        result = await agent.run("loop", "nowrap")
+        self.assertEqual(result.output, "达到模型调用步数上限")
+        self.assertEqual(len(agent.provider.calls), 1)
+
+    async def test_malformed_model_output_is_retried_with_correction(self):
+        class Flaky:
+            def __init__(self):
+                self.calls = []
+
+            async def complete(self, messages, tools):
+                self.calls.append([m.content for m in messages])
+                if len(self.calls) == 1:
+                    raise ModelFormatError("模型 API 响应结构无效")
+                return ModelResponse("好了")
+
+        provider = Flaky()
+        agent = Agent(provider, store=self.store, workspace=Path(self.tmp.name) / "work")
+        result = await agent.run("hi", "flaky")
+        self.assertEqual((result.status, result.output), ("completed", "好了"))
+        self.assertIn("无法使用", provider.calls[1][-1])
+        self.assertNotIn("无法使用", " ".join(provider.calls[0]))
+        # 纠正提示只用于重试，不写入会话历史。
+        self.assertEqual([m["role"] for m in self.store.load_session("flaky")["messages"]], ["user", "assistant"])
+        self.assertIn("model_retry", [e["type"] for e in self.store.events("flaky")])
+
+    async def test_malformed_output_fails_after_retry_budget(self):
+        class Broken:
+            calls = 0
+
+            async def complete(self, messages, tools):
+                Broken.calls += 1
+                raise ModelFormatError("模型 API 响应结构无效")
+
+        agent = Agent(Broken(), store=self.store, workspace=Path(self.tmp.name) / "work",
+                      config=AgentConfig(format_retries=1))
+        result = await agent.run("hi", "broken")
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(Broken.calls, 2)
+
+    async def test_old_turns_are_summarized_instead_of_dropped(self):
+        agent = self.agent([ModelResponse("a" * 300), ModelResponse("SUMMARY-OF-FIRST-TURN"), ModelResponse("done")],
+                           config=AgentConfig(system_prompt="system", max_context_chars=800))
+        await agent.run("first", "sum")
+        result = await agent.run("second" * 30, "sum")
+        self.assertEqual(result.output, "done")
+        state = self.store.load_session("sum")
+        self.assertEqual(len(state["messages"]), 4)  # 完整历史仍然保留
+        self.assertEqual((state["summary"], state["summary_upto"]), ("SUMMARY-OF-FIRST-TURN", 2))
+        final = agent.provider.calls[-1]["messages"]
+        self.assertIn("SUMMARY-OF-FIRST-TURN", final[0].content)
+        self.assertNotIn("a" * 300, json.dumps([m.content for m in final]))
+        self.assertIn("context_summarized", [e["type"] for e in self.store.events("sum")])
+        # 摘要跨 run 保留，下一轮不会丢失。
+        agent.provider.responses.append(ModelResponse("third"))
+        await agent.run("third turn", "sum")
+        self.assertIn("SUMMARY-OF-FIRST-TURN", agent.provider.calls[-1]["messages"][0].content)
+
+    async def test_summary_failure_falls_back_to_trimming(self):
+        class NoSummary:
+            def __init__(self):
+                self.calls = 0
+
+            async def complete(self, messages, tools):
+                self.calls += 1
+                if messages[0].content.startswith("你负责压缩"):
+                    raise RuntimeError("summary backend down")
+                return ModelResponse("a" * 300 if self.calls == 1 else "ok")
+
+        agent = Agent(NoSummary(), store=self.store, workspace=Path(self.tmp.name) / "work",
+                      config=AgentConfig(system_prompt="system", max_context_chars=800))
+        await agent.run("first", "nosum")
+        result = await agent.run("second" * 30, "nosum")
+        self.assertEqual((result.status, result.output), ("completed", "ok"))
+        self.assertEqual(self.store.load_session("nosum").get("summary"), "")
+
     def test_config_validation(self):
-        for kwargs in [{"max_steps": 0}, {"max_steps": True}, {"run_timeout": float("inf")}]:
+        for kwargs in [{"max_steps": 0}, {"max_steps": True}, {"run_timeout": float("inf")},
+                       {"format_retries": -1}, {"wrap_up": 1}, {"summarize_history": "yes"}]:
             with self.assertRaises(ValueError):
                 AgentConfig(**kwargs)
 

@@ -21,7 +21,7 @@ from pathlib import Path
 import urllib.parse
 from urllib.parse import urlsplit
 
-from .agent import Agent, SessionError
+from .agent import Agent, AgentConfig, SessionError
 from .evaluation import EvalCase, evaluate
 from .providers import DemoProvider, OpenAICompatibleProvider, ProviderError
 from .storage import SQLiteStore
@@ -66,6 +66,12 @@ class APIError(Exception):
         self.status, self.message = status, message
 
 
+# 可在设置里调整的运行预算：名称 -> (下限, 上限)。未设置的项使用 AgentConfig 默认值。
+BUDGET_LIMITS = {"max_steps": (1, 500), "max_tool_calls": (1, 2000),
+                 "max_total_tokens": (1000, 50000000), "run_timeout": (10, 86400),
+                 "max_context_chars": (4000, 2000000)}
+
+
 class App:
     MAX_ACTIVE_JOBS = 4
     MAX_JOBS = 100
@@ -106,6 +112,7 @@ class App:
             "searx_url": os.environ.get("AGENTLAB_SEARX_URL", "").strip(),
         }
         self._secrets = {value for value in (self._api_key, self._search_settings["api_key"]) if value}
+        self._budgets = {}
         try:
             self._search_settings = self._validate_search(self._search_settings)
         except APIError:
@@ -121,6 +128,7 @@ class App:
                               backend=saved.get("search_backend", self._search_settings["backend"]),
                               searx_url=saved.get("searx_url", self._search_settings["searx_url"]))
                 self._search_settings = self._validate_search(search)
+                self._budgets = self._validate_budgets(saved.get("budgets", {}))
                 self._config = candidate
             except (APIError, ValueError, TypeError, AttributeError, OSError, ProviderError):
                 mode = "演示模式" if default_provider == "demo" else "真实模型默认配置"
@@ -143,7 +151,30 @@ class App:
                         search_backend=self._search_settings.get("backend") or "",
                         has_search_key=bool(self._search_settings.get("api_key")),
                         searx_url=self._search_settings.get("searx_url") or "",
+                        budgets=dict(self._budgets), budget_defaults=self._budget_defaults(),
                         allow_demo=self.allow_demo)
+
+    @staticmethod
+    def _budget_defaults():
+        defaults = AgentConfig()
+        return {name: getattr(defaults, name) for name in BUDGET_LIMITS}
+
+    @staticmethod
+    def _validate_budgets(value):
+        """只接受已知预算项的有限数值；空对象表示全部恢复默认。"""
+        if not isinstance(value, dict):
+            raise APIError(400, "budgets 必须为对象")
+        clean = {}
+        for name, raw in value.items():
+            if name not in BUDGET_LIMITS:
+                raise APIError(400, "未知的预算项：" + str(name))
+            low, high = BUDGET_LIMITS[name]
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not low <= raw <= high:
+                raise APIError(400, "%s 必须在 %s 到 %s 之间" % (name, low, high))
+            if name != "run_timeout" and raw != int(raw):
+                raise APIError(400, name + " 必须为整数")
+            clean[name] = float(raw) if name == "run_timeout" else int(raw)
+        return clean
 
     def _validate_config(self, config, key):
         if config.get("provider") not in ("demo", "openai"):
@@ -224,15 +255,18 @@ class App:
                     raise APIError(400, "不能同时设置并清除检索 API Key")
                 search["api_key"] = ""
             search = self._validate_search(search)
+            budgets = self._validate_budgets(payload["budgets"]) if "budgets" in payload else dict(self._budgets)
             temporary = self.data_dir / (".web-settings-" + uuid.uuid4().hex + ".tmp")
             try:
-                saved = dict(candidate, search_backend=search["backend"], searx_url=search["searx_url"])
+                saved = dict(candidate, search_backend=search["backend"], searx_url=search["searx_url"],
+                             budgets=budgets)
                 temporary.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
                 temporary.replace(self.data_dir / "web-settings.json")
             finally:
                 temporary.unlink(missing_ok=True)
             self._config, self._api_key = candidate, key
             self._search_settings = search
+            self._budgets = budgets
             self.config_warning = ""
             if key:
                 self._secrets.add(key)
@@ -280,8 +314,10 @@ class App:
                         if state and state.get("run_id") == event.get("run_id"):
                             job["_session_ids"].add(row["session_id"])
                             break
+        with self._lock:
+            budgets = dict(self._budgets)
         return Agent(self._provider(), tools=self.tools, store=self.store,
-                     workspace=self.workspace, on_event=event,
+                     workspace=self.workspace, on_event=event, config=AgentConfig(**budgets),
                      tool_settings={"search": dict(self._search_settings)})
 
     def _delta_handler(self, job):

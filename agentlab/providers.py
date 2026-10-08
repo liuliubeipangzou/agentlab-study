@@ -26,6 +26,14 @@ class ProviderError(RuntimeError):
     """可向用户显示的适配器错误；不包含密钥或远端响应正文。"""
 
 
+class ModelFormatError(ProviderError):
+    """模型返回了无法使用的内容（非法工具参数、空响应、被截断）。
+
+    与网络或认证错误不同，重新生成往往就能恢复，因此由 Agent 带着纠正提示重试，
+    而不是让整次运行失败。
+    """
+
+
 class ProviderConfigurationError(ProviderError):
     """模型连接配置无效。"""
 
@@ -200,7 +208,7 @@ class _StreamResponse:
                     raise ProviderError("模型流式结束原因无效。")
                 self.finish = reason
                 if reason == "length":
-                    raise ProviderError("模型响应达到输出上限；请提高 max_output_tokens 或缩短请求。")
+                    raise ModelFormatError("模型响应达到输出上限；请提高 max_output_tokens 或缩短请求。")
                 if reason == "content_filter":
                     raise ProviderError("模型 API 未提供可用响应（content_filter）。")
         usage = event.get("usage")
@@ -286,16 +294,19 @@ def _valid_identifier(value):
 class OpenAICompatibleProvider:
     """OpenAI Chat Completions 的小型 HTTP 适配器（不依赖厂商 SDK）。
 
-    仅对连接错误、429、5xx 重试，最多 max_retries 次，每次退避最多 5 秒。
+    仅对连接错误、429、5xx 重试，最多 max_retries 次；退避从 1 秒起指数增长，
+    遵守 Retry-After，单次等待最多 30 秒。
     所有重定向均禁止，防止 Authorization 被转发至其他主机。
     """
 
     MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+    MAX_RETRY_DELAY = 30.0
+    RETRY_BASE_DELAY = 1.0
     supports_tool_streaming = True
 
     def __init__(self, model: str, api_key: str,
-                 base_url: str = "https://api.openai.com/v1", timeout: float = 30,
-                 max_retries: int = 2, max_output_tokens: int = 2048):
+                 base_url: str = "https://api.openai.com/v1", timeout: float = 120,
+                 max_retries: int = 4, max_output_tokens: int = 8192):
         if not isinstance(model, str) or not model.strip():
             raise ProviderConfigurationError("请设置非空模型名 AGENTLAB_MODEL。")
         if not isinstance(api_key, str) or not api_key.strip() or "\n" in api_key or "\r" in api_key:
@@ -341,7 +352,7 @@ class OpenAICompatibleProvider:
             except _RetryableError as exc:
                 if attempt == self.max_retries:
                     raise ProviderError(str(exc)) from None
-                delay = min(5.0, max(0.25 * (2 ** attempt), exc.retry_after))
+                delay = min(self.MAX_RETRY_DELAY, max(self.RETRY_BASE_DELAY * (2 ** attempt), exc.retry_after))
                 await asyncio.sleep(delay)
         raise ProviderError("模型请求失败。")  # Defensive; loop always returns or raises.
 
@@ -368,7 +379,7 @@ class OpenAICompatibleProvider:
             except _RetryableError as exc:
                 if attempt == self.max_retries:
                     raise ProviderError(str(exc)) from None
-                delay = min(5.0, max(0.25 * (2 ** attempt), exc.retry_after))
+                delay = min(self.MAX_RETRY_DELAY, max(self.RETRY_BASE_DELAY * (2 ** attempt), exc.retry_after))
                 await asyncio.sleep(delay)
         raise ProviderError("模型请求失败。")
 
@@ -489,7 +500,7 @@ class OpenAICompatibleProvider:
             if exc.headers:
                 try:
                     candidate = float(exc.headers.get("Retry-After", "0"))
-                    retry_after = min(5.0, max(0.0, candidate)) if math.isfinite(candidate) else 0.0
+                    retry_after = min(self.MAX_RETRY_DELAY, max(0.0, candidate)) if math.isfinite(candidate) else 0.0
                 except (ValueError, TypeError):
                     pass
             exc.close()
@@ -566,7 +577,7 @@ class OpenAICompatibleProvider:
             if exc.headers:
                 try:
                     candidate = float(exc.headers.get("Retry-After", "0"))
-                    retry_after = min(5.0, max(0.0, candidate)) if math.isfinite(candidate) else 0.0
+                    retry_after = min(self.MAX_RETRY_DELAY, max(0.0, candidate)) if math.isfinite(candidate) else 0.0
                 except (ValueError, TypeError):
                     pass
             exc.close()
@@ -628,7 +639,7 @@ class OpenAICompatibleProvider:
                 raise ValueError("Invalid token count")
             # Never execute truncated tool arguments even when the JSON happens to parse.
             if choice.get("finish_reason") == "length":
-                raise ProviderError("模型响应达到输出上限；请提高 max_output_tokens 或缩短请求。")
+                raise ModelFormatError("模型响应达到输出上限；请提高 max_output_tokens 或缩短请求。")
             if choice.get("finish_reason") == "content_filter":
                 raise ProviderError("模型 API 未提供可用响应（content_filter）。")
             if not content and not calls:
@@ -636,7 +647,7 @@ class OpenAICompatibleProvider:
             return ModelResponse(content=content, tool_calls=calls,
                                  usage=Usage(input_tokens=incoming, output_tokens=outgoing))
         except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
-            raise ProviderError("模型 API 响应结构无效；需要 Chat Completions 文本或函数工具调用。") from None
+            raise ModelFormatError("模型 API 响应结构无效；需要 Chat Completions 文本或函数工具调用。") from None
 
 
 def provider_from_env(provider: str = "demo"):

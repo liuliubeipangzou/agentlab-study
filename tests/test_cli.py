@@ -45,6 +45,17 @@ class CLIIntegrationTests(unittest.TestCase):
             return json.loads(process.stdout)
         return process
 
+    def test_budget_flags_reach_agent_and_session_can_be_deleted(self):
+        # 预算参数应真正生效：一步上限会让需要两步的任务触顶；--max-tokens/--timeout 也被接受。
+        process = self.invoke("--max-steps", "1", "--max-tokens", "100000", "--timeout", "30",
+                              "run", "/calc 2 + 2", "--session", "budgeted", expected=1)  # limited 退出码为 1
+        limited = json.loads(process.stdout)
+        self.assertEqual(limited["status"], "limited")
+        self.assertIn("达到模型调用步数上限", limited["output"])
+        self.assertEqual(self.invoke("delete", "budgeted"), {"deleted": "budgeted"})
+        missing = self.invoke("inspect", "budgeted", expected=2, as_json=False)
+        self.assertIn("未找到会话", missing.stderr)
+
     def test_run_continues_session_across_processes_in_custom_directories(self):
         first = self.invoke("run", "/calc (6 + 1) * 6", "--session", "persistent-session")
         self.assertEqual(first["status"], "completed")

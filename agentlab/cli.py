@@ -15,6 +15,22 @@ from .storage import SQLiteStore
 from .tools import create_builtin_tools
 
 
+def _budget_flags(args):
+    return [(flag, getattr(args, name)) for flag, name in (
+        ("--max-steps", "max_steps"), ("--max-tool-calls", "max_tool_calls"),
+        ("--max-tokens", "max_tokens"), ("--timeout", "timeout")) if getattr(args, name, None) is not None]
+
+
+def _config_from_args(args):
+    overrides = {}
+    for field, name in (("max_steps", "max_steps"), ("max_tool_calls", "max_tool_calls"),
+                        ("max_total_tokens", "max_tokens"), ("run_timeout", "timeout")):
+        value = getattr(args, name, None)
+        if value is not None:
+            overrides[field] = value
+    return AgentConfig(**overrides)
+
+
 def parser():
     root = argparse.ArgumentParser(prog="agentlab", description="Agent Lab · 可阅读、可运行的 Python Agent 学习框架")
     root.add_argument("--provider", choices=["openai", "demo"], default="openai",
@@ -26,7 +42,11 @@ def parser():
     root.add_argument("--stream", action="store_true",
                       help="流式打印模型回复，支持工具调用回合（需模型支持流式）")
     # 同一个开关也挂到子命令上，使 `run --stream ...` 这种自然写法同样有效。
-    root.add_argument("--max-steps", type=int, default=8)
+    # 预算类参数留空时使用 AgentConfig 的默认值。
+    root.add_argument("--max-steps", type=int, default=None, help="单次运行的最大模型调用步数")
+    root.add_argument("--max-tool-calls", type=int, default=None, help="单次运行的最大工具调用次数")
+    root.add_argument("--max-tokens", type=int, default=None, help="单次运行累计 token 上限")
+    root.add_argument("--timeout", type=float, default=None, help="单次运行的时间预算（秒，不含等待审批）")
     sub = root.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="执行一次任务")
     run.add_argument("prompt")
@@ -118,7 +138,9 @@ def show_result(result, as_json=False, args=None, streamed=False):
         base = ["python3", "-m", "agentlab"]
         if args is not None:
             base += ["--provider", args.provider, "--data-dir", str(Path(args.data_dir).resolve()),
-                     "--workspace", str(Path(args.workspace).resolve()), "--max-steps", str(args.max_steps)]
+                     "--workspace", str(Path(args.workspace).resolve())]
+            for flag, value in _budget_flags(args):
+                base += [flag, str(value)]
         print("批准：" + shlex.join(base + ["approve", result.session_id, "--all"]))
         print("拒绝：" + shlex.join(base + ["deny", result.session_id]))
 
@@ -190,7 +212,7 @@ async def dispatch(args):
             print("[{}] {}".format(event["type"], json.dumps(event["data"], ensure_ascii=False)), file=sys.stderr)
         provider = provider_from_env(args.provider)
         agent = Agent(provider, store=store, workspace=args.workspace,
-                      config=AgentConfig(max_steps=args.max_steps), on_event=trace if args.verbose else None,
+                      config=_config_from_args(args), on_event=trace if args.verbose else None,
                       tool_settings=_tool_settings_from_env())
         on_delta = _delta_printer(args)
         if args.command == "run":
