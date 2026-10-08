@@ -1,6 +1,6 @@
 # Agent Lab · 可用的本地 Agent
 
-一套带本地浏览器界面的 Python Agent 框架。**默认使用真实模型**，用自然语言驱动 12 个内置工具完成检索、抓取、调用 API、执行代码与文件操作。Python **3.9+**，运行与测试只需标准库。
+一套带本地浏览器界面的 Python Agent 框架。**默认使用真实模型**，用自然语言驱动 20 个内置工具完成检索、抓取、调用 API、改代码、跑命令、执行代码与文件操作。Python **3.9+**，运行与测试只需标准库。
 
 填入 API Key 即可开始；离线规则演示模式仍然保留，但需要显式开启，仅用于观察框架行为。
 
@@ -28,19 +28,30 @@ index 对齐重组，经完整校验后才执行，不会执行半截参数。�
 
 也可以在浏览器界面里配置：运行 `python3 -m agentlab serve --open`，在**设置**中填写模型、API 地址与 Key 并保存。**界面输入的 Key 只保留在服务内存中，停止服务后需重新填写。**
 
-## 内置工具（12 个）
+## 内置工具（20 个）
 
 | 工具 | 作用 | 风险 |
 | --- | --- | --- |
 | `web_search` | 联网检索，返回标题/链接/摘要。默认免密钥后端，也可配 Brave / Tavily / SearXNG | 读 |
-| `fetch_url` | 抓取网页并转为纯文本，便于阅读正文 | 读 |
+| `fetch_url` | 抓取网页并转为纯文本；长网页用 `offset` 分页继续读 | 读 |
 | `http_request` | 调用外部 HTTP API，支持自定义方法与请求头 | 读（POST/PUT/PATCH/DELETE 需审批） |
-| `run_python` | 在受限子进程中执行 Python，用 `result` 返回数据 | **写**（需审批） |
+| `run_shell` | 在工作区内用 `/bin/sh` 执行命令（跑测试、构建、命令行工具），超长输出保留首尾 | **执行**（默认清单内的查看/测试命令自动放行，其余需审批） |
+| `git` | status/diff/log/show/blame 等只读命令免审批；其余按子命令分级：add/commit 等为执行，push/fetch 为向外部写入，reset --hard/clean/强制推送为难以撤销 | 读 / 执行 / 外部写入 / **难以撤销** |
+| `run_python` | 在受限子进程中执行 Python，用 `result` 返回数据 | **执行**（需审批） |
+| `read_file` | 读文件；带 `offset`/`limit` 时按行分页（带行号，最大 8 MiB） | 读 |
+| `write_file` / `append_file` | 整文件写入 / 末尾追加（长内容分段写），保留已有文件的权限位 | **写** |
+| `edit_file` | 精确字符串替换（`old_string` 必须唯一），返回 diff | **写** |
+| `glob` / `grep` | 按模式找文件 / 搜索内容（正则在子进程里跑，可被超时杀掉），自动跳过 `.git`、`node_modules` 等 | 读 |
+| `list_files` | 列出工作区文件与目录 | 读 |
+| `todo_write` | 维护任务清单，显示在对话上方，并在长对话中保留 | 读 |
+| `ask_user` | 缺少关键信息时暂停并向你提问，回答后继续 | 读（暂停等待你） |
+| `now` | 当前日期、时间与时区 | 读 |
 | `search_knowledge` | 检索本地知识库（中英文 BM25） | 读 |
-| `read_file` / `list_files` / `write_file` | 工作区内文件读取、列目录与写入，写入需审批 | 读 / 读 / **写** |
 | `calculator` | AST 白名单数值计算，不使用 `eval` | 读 |
 | `remember` / `recall` | 会话级键值记忆，写入需审批 | **写** / 读 |
 | `search_memory` | **跨会话**长期记忆检索（BM25 + IDF 排序） | 读 |
+
+文件工具默认**拒绝访问 `.git/` 与 `.env*`（`.env.example` 等模板除外）**：前者的 hooks/config 能让后续 git 命令执行任意代码，后者通常含密钥且读取后会进入模型请求。可通过 `tool_settings={"protected_paths": ["*.pem"]}` 追加模式。`run_shell`/`run_python` 不受此限制，它们以你的权限运行。
 
 所有联网请求都经过内置的 **SSRF 防护**：拒绝回环、私网、链路本地、CGNAT 与云元数据地址（含 IPv6 与映射地址），DNS 解析出的每个地址都要通过校验，并在校验后的 IP 上建立连接以消除重绑定窗口；默认不自动跟随重定向，`Host`/`Content-Length` 等请求头禁止模型覆盖。
 
@@ -118,17 +129,19 @@ python3 -m agentlab eval
 
 ## 审批、记忆与会话恢复
 
+命令行与浏览器默认使用 **`auto-workspace`** 审批模式（见下一节）。要观察逐次审批的完整流程，下面的命令显式使用 `--approval-mode ask`：
+
 ```bash
 # 只产生审批检查点，此时尚未写入文件
-python3 -m agentlab run '/write notes/day1.txt 今天学会了工具调用' --session notebook
+python3 -m agentlab --approval-mode ask run '/write notes/day1.txt 今天学会了工具调用' --session notebook
 
 # 阅读参数后执行批准；也可用 --call CALL_ID 只批准指定操作
-python3 -m agentlab approve notebook --all
+python3 -m agentlab --approval-mode ask approve notebook --all
 python3 -m agentlab run '/read notes/day1.txt' --session notebook
 
 # 持久化个人学习目标，remember 也属于写入，需要批准
-python3 -m agentlab run '/remember goal 掌握Agent执行循环' --session notebook
-python3 -m agentlab approve notebook --all
+python3 -m agentlab --approval-mode ask run '/remember goal 掌握Agent执行循环' --session notebook
+python3 -m agentlab --approval-mode ask approve notebook --all
 python3 -m agentlab run '/recall goal' --session notebook
 
 # 观察保存的会话、消息及事件
@@ -137,7 +150,25 @@ python3 -m agentlab inspect notebook
 python3 -m agentlab trace notebook
 ```
 
-用 `deny SESSION` 拒绝待审批操作。交互聊天中可以直接输入 `/approve` 或 `/deny`。批准与调用 ID、参数所在检查点、工作目录、工具声明和模型端点绑定；下一次新的写入仍需审批。
+用 `deny SESSION --reason "你的意见"` 拒绝待审批操作，理由会告诉模型，让它按你的意见调整做法。交互聊天中可以输入 `/approve`、`/approve session`（同时记住这类操作）或 `/deny 理由`。批准与调用 ID、参数所在检查点、工作目录、工具声明和模型端点绑定；下一次新的写入仍需审批（除非命中规则）。
+
+### 审批模式与“总是允许”
+
+每个工具调用有风险等级：`read` 只读、`write` 写工作区、`exec` 执行命令或修改仓库、`network_write` 向外部写入或同步、`destructive` 难以撤销（`reset --hard`、`clean`、强制推送、`rm -rf` 等）。三种模式决定哪些调用无需你点头：
+
+| 模式 | 自动放行 | 仍然询问 |
+| --- | --- | --- |
+| `ask`（库的默认） | 只有你记住的规则 | 其余全部 |
+| `auto-workspace`（命令行与浏览器的默认） | 工作区内的文件与记忆写入；`run_shell` 里**不含 shell 元字符、不指向工作区之外**、且在默认清单中的命令（`ls`、`cat`、`grep`、`pytest`、`python -m unittest`、`npm test`、`cargo test`、`go test`、`make test` 等） | 其他命令、git 提交/推送、联网写入、一切 `destructive` |
+| `trust` | 全部，包括 `destructive` | 无 |
+
+选择方式：`--approval-mode ask|auto-workspace|trust`、环境变量 `AGENTLAB_APPROVAL_MODE`，或浏览器“设置 → 审批方式”。`trust` 需要显式开启，浏览器里还要勾选确认。
+
+**请务必知道**：`auto-workspace` 自动放行测试与构建命令，意味着 Agent 刚写下的代码可以不经确认地被运行；网页或文档里的恶意指令因此有机会借助“写文件 + 跑测试”执行代码。不放心时使用 `ask`。
+
+审批卡片（命令行与浏览器）会显示风险等级和**预览**：文件写入与编辑显示 diff，命令与代码原样显示。批准时可以选择“**总是允许此类操作**”（仅本会话，或所有会话）：规则按命令前缀、git 子命令、HTTP 主机或工具归纳；含 shell 元字符的变体不会命中；`destructive` 永远不能被记住。规则可以在浏览器设置页和 `rules` 命令里撤销（会话级规则在检查器的“审批”标签里撤销）。所有自动与人工决定都写入审计表，可用 `approvals SESSION` 查看。
+
+Agent 用 `ask_user` 提问时会话进入 `waiting_input`：命令行输出会给出现成的回答命令，也可以运行 `python3 -m agentlab answer SESSION "你的回答"`（会话里只有一个问题时无需 `--call`）；交互聊天里下一行输入就是回答；浏览器里在提问卡片中点选项或输入后回复。提问期间不能开新任务。若等待期间工具集发生变化，已批准但尚未执行的写操作会被自动取消，而不是沿用旧的批准。
 
 默认状态存入 `.agentlab/agentlab.sqlite3`，工具只可读写 `workspace/`。全局选项放在子命令之前：
 
@@ -213,7 +244,8 @@ agentlab/
   types.py         消息、工具调用、模型响应协议
   agent.py         Agent 状态机、审批、预算、恢复
   providers.py     三种模型实现
-  tools.py         工具注册、校验、12 个内置工具
+  tools.py         工具注册、校验、20 个内置工具
+  filetools.py     文件工具：分页读、追加、精确编辑、glob、grep、受保护路径
   storage.py       SQLite、记忆、知识索引、会话租约
   workflows.py     DAG 调度、并发、失败传播
   planning.py      结构化输出与计划执行

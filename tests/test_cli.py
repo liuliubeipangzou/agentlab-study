@@ -29,6 +29,8 @@ class CLIIntegrationTests(unittest.TestCase):
             "PYTHONIOENCODING": "utf-8",
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
+            # 这些测试验证“写入需要审批”的流程；默认的 auto-workspace 有单独的测试。
+            "AGENTLAB_APPROVAL_MODE": "ask",
         }
 
     def invoke(self, *arguments, as_json=True, provider="demo", expected=0):
@@ -44,6 +46,56 @@ class CLIIntegrationTests(unittest.TestCase):
         if as_json and expected == 0:
             return json.loads(process.stdout)
         return process
+
+    def test_default_mode_is_auto_workspace_and_flag_overrides_it(self):
+        env = dict(self.environment)
+        env.pop("AGENTLAB_APPROVAL_MODE")
+        self.environment = env  # 不设置模式：命令行默认 auto-workspace
+        auto = self.invoke("run", "/write auto.txt hello")
+        self.assertEqual(auto["status"], "completed")
+        self.assertEqual((self.workspace / "auto.txt").read_text(), "hello")
+        asked = self.invoke("--approval-mode", "ask", "run", "/write asked.txt hello")
+        self.assertEqual(asked["status"], "waiting_approval")
+        self.assertFalse((self.workspace / "asked.txt").exists())
+        bad = self.invoke("--approval-mode", "yolo", "run", "/calc 1+1", expected=2, as_json=False)
+        self.assertIn("invalid choice", bad.stderr)
+        self.environment = dict(env, AGENTLAB_APPROVAL_MODE="nonsense")
+        wrong = self.invoke("run", "/calc 1+1", expected=2, as_json=False)
+        self.assertIn("approval_mode", wrong.stderr)
+
+    def test_waiting_output_shows_preview_and_hints_for_remembering(self):
+        (self.workspace).mkdir(parents=True, exist_ok=True)
+        (self.workspace / "a.txt").write_text("old\n")
+        process = self.invoke("run", "/write a.txt new", as_json=False)
+        self.assertIn("风险：写入工作区", process.stdout)
+        self.assertIn("覆盖写入 a.txt", process.stdout)
+        self.assertIn("| -old", process.stdout)
+        self.assertIn("| +new", process.stdout)
+        self.assertIn("--remember session", process.stdout)
+        self.assertIn("--reason", process.stdout)
+
+    def test_deny_reason_remember_and_audit_commands(self):
+        waiting = self.invoke("run", "/write one.txt 1")
+        denied = self.invoke("deny", waiting["session_id"], "--reason", "请改用 docs 目录")
+        self.assertEqual(denied["status"], "completed")
+        messages = self.invoke("inspect", waiting["session_id"])["messages"]
+        self.assertIn("请改用 docs 目录", next(m for m in messages if m["role"] == "tool")["content"])
+        self.assertFalse((self.workspace / "one.txt").exists())
+        second = self.invoke("run", "/write two.txt 2")
+        approved = self.invoke("approve", second["session_id"], "--all", "--remember", "global", "--reason", "x")
+        self.assertEqual(approved["status"], "completed")
+        rules = self.invoke("rules")
+        self.assertEqual([(r["tool"], r["match"]) for r in rules], [("write_file", {"kind": "tool"})])
+        # 全局规则对新会话生效：同类写入不再暂停；撤销后恢复询问。
+        auto = self.invoke("run", "/write three.txt 3")
+        self.assertEqual(auto["status"], "completed")
+        audit = self.invoke("approvals", auto["session_id"])
+        self.assertEqual([(a["tool"], a["decision"], a["source"]) for a in audit],
+                         [("write_file", "auto", "rule:" + rules[0]["id"])])
+        self.assertEqual(self.invoke("rules", "--delete", rules[0]["id"]), [])
+        self.assertEqual(self.invoke("run", "/write four.txt 4")["status"], "waiting_approval")
+        self.invoke("rules", "--delete", "missing", expected=2, as_json=False)
+        self.invoke("approvals", "missing", expected=2, as_json=False)
 
     def test_budget_flags_reach_agent_and_session_can_be_deleted(self):
         # 预算参数应真正生效：一步上限会让需要两步的任务触顶；--max-tokens/--timeout 也被接受。

@@ -22,6 +22,7 @@ import urllib.parse
 from urllib.parse import urlsplit
 
 from .agent import Agent, AgentConfig, SessionError
+from .approvals import DEFAULT_ALLOWED_COMMANDS, MODES, build_preview, suggest_rule
 from .evaluation import EvalCase, evaluate
 from .providers import DemoProvider, OpenAICompatibleProvider, ProviderError
 from .storage import SQLiteStore
@@ -100,10 +101,14 @@ class App:
         default_provider = "openai"
         if requested == "demo" and self.allow_demo:
             default_provider = "demo"
+        requested_mode = os.environ.get("AGENTLAB_APPROVAL_MODE", "").strip().lower()
         self._config = {"provider": default_provider,
                         "model": os.environ.get("AGENTLAB_MODEL") or "deepseek-flash",
                         "base_url": os.environ.get("AGENTLAB_BASE_URL") or "https://api.deepseek.com",
-                        "streaming": True}
+                        "streaming": True,
+                        # 浏览器界面默认让工作区内的写入自动放行，这样长任务不必每步点击；
+                        # 执行命令等仍然询问。可改为 ask（逐次询问）或 trust（全部自动）。
+                        "approval_mode": requested_mode if requested_mode in MODES else "auto-workspace"}
         self._api_key = os.environ.get("AGENTLAB_API_KEY", "").strip()
         # 检索后端配置（web_search 使用）；随 settings 下发到工具上下文。
         self._search_settings = {
@@ -152,6 +157,7 @@ class App:
                         has_search_key=bool(self._search_settings.get("api_key")),
                         searx_url=self._search_settings.get("searx_url") or "",
                         budgets=dict(self._budgets), budget_defaults=self._budget_defaults(),
+                        approval_modes=list(MODES), default_commands=list(DEFAULT_ALLOWED_COMMANDS),
                         allow_demo=self.allow_demo)
 
     @staticmethod
@@ -183,6 +189,8 @@ class App:
             raise APIError(400, "演示模式已停用；请选择真实模型并填写 API Key")
         if type(config.get("streaming")) is not bool:
             raise APIError(400, "streaming 必须为布尔值")
+        if config.get("approval_mode") not in MODES:
+            raise APIError(400, "approval_mode 必须是 %s 之一" % "、".join(MODES))
         if any(not isinstance(config.get(name), str) for name in ("model", "base_url")):
             raise APIError(400, "model 和 base_url 必须为字符串")
         if not isinstance(key, str):
@@ -316,8 +324,10 @@ class App:
                             break
         with self._lock:
             budgets = dict(self._budgets)
+            approval_mode = self._config["approval_mode"]
         return Agent(self._provider(), tools=self.tools, store=self.store,
-                     workspace=self.workspace, on_event=event, config=AgentConfig(**budgets),
+                     workspace=self.workspace, on_event=event,
+                     config=AgentConfig(approval_mode=approval_mode, **budgets),
                      tool_settings={"search": dict(self._search_settings)})
 
     def _delta_handler(self, job):
@@ -442,18 +452,28 @@ class App:
             active_job_id = next((job["job_id"] for job in self._jobs.values()
                 if job["status"] == "running" and (job.get("session_id") == session_id
                     or session_id in job["_session_ids"])), None)
-        # 由服务端判定每个待处理调用是否需要审批：条件审批工具（如 POST 的 http_request）
-        # 的风险级别是 read，前端只看 risk 会漏掉勾选框，导致调用永远被拒绝。
-        pending = []
+        # 由服务端判定每个待处理调用的审批状态，前端不再自己推断：
+        #   needs_approval  需要用户现在决定（需要审批且还没有决定）；
+        #   auto_approved   已被审批策略自动放行（模式或规则），只展示；
+        #   risk / preview / suggested_rule  供审批卡片展示风险、改动预览与“总是允许”的选项。
+        pending, decisions = [], state.get("decisions", {})
         for raw in state.get("pending", []):
             item = dict(raw)
             try:
-                item["needs_approval"] = self.tools.requires_approval(ToolCall.from_dict(raw))
+                call = ToolCall.from_dict(raw)
+                risk = self.tools.call_risk(call)
+                gated = risk != "read"
+                item.update(risk=risk, interactive=self.tools.is_interactive(call),
+                            needs_approval=gated and raw["id"] not in decisions,
+                            auto_approved=gated and decisions.get(raw["id"]) is True)
+                if item["needs_approval"]:
+                    item["preview"] = build_preview(call, self.workspace)
+                    item["suggested_rule"] = suggest_rule(call, risk)
             except Exception:
-                item["needs_approval"] = True
+                item.update(risk="destructive", interactive=False, needs_approval=True, auto_approved=False)
             pending.append(item)
         return dict(state, pending=pending, events=self.store.events(session_id),
-                    memory=self.store.recall(session_id),
+                    memory=self.store.recall(session_id), approvals=self.store.list_approvals(session_id),
                     active=active_job_id is not None, active_job_id=active_job_id)
 
     async def _evaluate(self, job):
@@ -521,7 +541,10 @@ class App:
                 definitions = self.tools.definitions()
                 for definition in definitions:
                     tool = self.tools.get(definition["function"]["name"])
-                    definition.update(risk=tool.risk, timeout=tool.timeout)
+                    definition.update(risk=tool.risk, timeout=tool.timeout,
+                                      conditional_approval=tool.approval is not None or tool.risk_of is not None,
+                                      interactive=tool.interactive,
+                                      approval_description=tool.approval_description)
                 return {"csrf_token": self.csrf_token, "config": self.public_config(),
                         "warning": self.config_warning,
                         "stats": dict(self.store.knowledge_stats(), sessions=len(self.store.list_sessions())),
@@ -540,6 +563,8 @@ class App:
                 if remainder.endswith("/events"):
                     return self.job_events(remainder[:-len("/events")], since=_query_int(query, "since", 0))
                 return self.job(remainder)
+            if path == "/api/approval/rules":
+                return {"rules": self.store.list_approval_rules(), "mode": self.public_config()["approval_mode"]}
             if path == "/api/knowledge":
                 return {"documents": self.store.list_documents(), "stats": self.store.knowledge_stats()}
             if path == "/api/files":
@@ -584,7 +609,7 @@ class App:
                     agent = self._agent(job)
                     return await agent.run(prompt, session_id, on_delta=self._delta_handler(job))
                 return {"session_id": session_id, "job_id": self.submit(run, session_id, require_provider=True)}
-            match = re.fullmatch(r"/api/sessions/([A-Za-z0-9_-]{1,128})/(approve|recover|delete)", path)
+            match = re.fullmatch(r"/api/sessions/([A-Za-z0-9_-]{1,128})/(approve|recover|delete|answer)", path)
             if match:
                 session_id, action = match.groups()
                 self._session(session_id)
@@ -603,13 +628,49 @@ class App:
                 if action == "recover":
                     return Agent(DemoProvider(), tools=self.tools, store=self.store,
                                  workspace=self.workspace).recover(session_id).to_dict()
+                if action == "answer":
+                    call_id, text = payload.get("call_id"), payload.get("answer")
+                    if not isinstance(call_id, str) or not isinstance(text, str) or not 1 <= len(text.strip()) <= 8000:
+                        raise APIError(400, "需要 call_id，以及 1 至 8000 字的 answer")
+                    async def answer(job):
+                        agent = self._agent(job)
+                        return await agent.answer(session_id, call_id, text, on_delta=self._delta_handler(job))
+                    return {"session_id": session_id, "job_id": self.submit(answer, session_id, require_provider=True)}
                 ids = payload.get("approved_call_ids")
                 if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
                     raise APIError(400, "approved_call_ids 必须为调用 ID 列表，空列表表示全部拒绝")
+                feedback, remember = payload.get("feedback"), payload.get("remember")
+                if feedback is not None and (not isinstance(feedback, str) or len(feedback) > 2000):
+                    raise APIError(400, "feedback 必须是不超过 2000 字的文本")
+                if remember not in (None, "session", "global"):
+                    raise APIError(400, "remember 只能是 session 或 global")
                 async def approve(job):
                     agent = self._agent(job)
-                    return await agent.resume(session_id, ids, on_delta=self._delta_handler(job))
+                    return await agent.resume(session_id, ids, on_delta=self._delta_handler(job),
+                                              feedback=feedback, remember=remember)
                 return {"session_id": session_id, "job_id": self.submit(approve, session_id, require_provider=True)}
+            if path == "/api/approval/rules/delete":
+                rule_id = payload.get("id")
+                if not isinstance(rule_id, str) or not rule_id:
+                    raise APIError(400, "需要规则 id")
+                if not self.store.delete_approval_rule(rule_id):
+                    raise APIError(404, "未找到该规则")
+                return {"rules": self.store.list_approval_rules()}
+            match = re.fullmatch(r"/api/sessions/([A-Za-z0-9_-]{1,128})/rules/delete", path)
+            if match:
+                session_id = match.group(1)
+                self._session(session_id)
+                rule_id = payload.get("id")
+                if not isinstance(rule_id, str) or not rule_id:
+                    raise APIError(400, "需要规则 id")
+                try:
+                    removed = Agent(DemoProvider(), tools=self.tools, store=self.store,
+                                    workspace=self.workspace).revoke_rule(session_id, rule_id)
+                except SessionError as exc:
+                    raise APIError(409, str(exc)) from None
+                if not removed:
+                    raise APIError(404, "未找到该规则")
+                return {"ok": True}
             if path == "/api/connection-test":
                 async def connection(job):
                     provider = self._provider()

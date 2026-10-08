@@ -4,7 +4,7 @@
 
 | 检查 | 结果 |
 | --- | --- |
-| `python3 -m unittest discover -s tests -q` | 295 项通过 |
+| `python3 -m unittest discover -s tests -q` | 365 项（含 1 项真实联网的 DuckDuckGo 冒烟测试，被对方限流时会失败，与代码无关） |
 | `node --test tests/web-state.test.cjs` | 3 项通过 |
 | `node --check agentlab/web/app.js` | 通过 |
 | `python3 -m examples.basic` | 通过，2 次模型调用、1 次工具调用、结果 42 |

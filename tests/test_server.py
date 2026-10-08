@@ -22,6 +22,7 @@ class ServerTests(unittest.TestCase):
         self.environment = patch.dict("os.environ", {"AGENTLAB_API_KEY": "", "AGENTLAB_MODEL": "deepseek-flash",
                                                        "AGENTLAB_BASE_URL": "https://api.deepseek.com",
                                                        "AGENTLAB_ALLOW_DEMO": "1",
+                                                       "AGENTLAB_APPROVAL_MODE": "ask",
                                                        "AGENTLAB_PROVIDER": "demo"})
         self.environment.start()
         self.app = App(self.root / "data", self.root / "work")
@@ -123,18 +124,23 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.wait_job(replay["job_id"])["status"], "failed")
 
     def test_conditional_approval_is_flagged_by_server_for_ui(self):
-        """http_request 的 POST 风险级别是 read，但需要审批；前端必须能据此显示勾选框并批准。"""
+        """http_request 的 POST 基础风险是 read，但需要审批；前端必须能据此显示勾选框并批准。"""
         from agentlab.providers import ScriptedProvider
         provider = ScriptedProvider([ModelResponse("", [
-            ToolCall("http_request", {"url": "https://example.com/", "method": "GET"}, "get1"),
-            ToolCall("http_request", {"url": "https://example.com/", "method": "POST", "body": "x"}, "post1")])])
+            ToolCall("calculator", {"expression": "1+1"}, "calc1"),
+            ToolCall("http_request", {"url": "https://example.com/", "method": "POST", "body": "x"}, "post1"),
+            ToolCall("http_request", {"url": "https://example.com/", "method": "GET"}, "get2")])])
         with patch.object(self.app, "_provider", return_value=provider):
             submitted = self.request("POST", "/api/run", {"prompt": "call api", "session_id": "cond"})[1]
             job = self.wait_job(submitted["job_id"])
         self.assertEqual(job["result"]["status"], "waiting_approval", job["result"])
         state = self.request("GET", "/api/sessions/cond")[1]
-        flags = {call["id"]: call["needs_approval"] for call in state["pending"]}
-        self.assertEqual(flags, {"get1": False, "post1": True})
+        # 排在前面的只读调用已经执行，待处理列表从第一个需要决定的调用开始。
+        self.assertEqual([c["id"] for c in state["pending"]], ["post1", "get2"])
+        self.assertEqual({c["id"]: c["needs_approval"] for c in state["pending"]}, {"post1": True, "get2": False})
+        self.assertEqual({c["id"]: c["risk"] for c in state["pending"]}, {"post1": "network_write", "get2": "read"})
+        self.assertEqual(state["pending"][0]["preview"], {"kind": "text", "title": "POST https://example.com/",
+                                                          "text": "x"})
         definition = next(x for x in self.request("GET", "/api/bootstrap")[1]["tools"]
                           if x["function"]["name"] == "http_request")
         self.assertEqual(definition["risk"], "read")
@@ -160,12 +166,115 @@ class ServerTests(unittest.TestCase):
         self.request("POST", "/api/config", {"budgets": {}})
         self.assertEqual(self.app.public_config()["budgets"], {})
 
+    def test_approval_mode_is_validated_persisted_and_applied(self):
+        config = self.request("GET", "/api/bootstrap")[1]["config"]
+        self.assertEqual(config["approval_mode"], "ask")  # 测试环境显式设置
+        self.assertEqual(config["approval_modes"], ["ask", "auto-workspace", "trust"])
+        self.assertIn("pytest", config["default_commands"])
+        self.assertEqual(self.request("POST", "/api/config", {"approval_mode": "yolo"})[0], 400)
+        self.assertEqual(self.request("POST", "/api/config", {"approval_mode": "auto-workspace"})[1]
+                         ["config"]["approval_mode"], "auto-workspace")
+        self.assertEqual(json.loads((self.root / "data" / "web-settings.json").read_text())["approval_mode"],
+                         "auto-workspace")
+        self.assertEqual(self.app._agent({"events": [], "_session_ids": set()}).config.approval_mode,
+                         "auto-workspace")
+        # 在 auto-workspace 下，演示提供者的写入命令不再暂停。
+        submitted = self.request("POST", "/api/run", {"prompt": "/write auto.txt hello"})[1]
+        done = self.wait_job(submitted["job_id"])
+        self.assertEqual(done["result"]["status"], "completed")
+        self.assertEqual((self.root / "work" / "auto.txt").read_text(), "hello")
+        state = self.request("GET", "/api/sessions/" + submitted["session_id"])[1]
+        self.assertEqual([(a["tool"], a["decision"], a["source"]) for a in state["approvals"]],
+                         [("write_file", "auto", "mode:auto-workspace")])
+
+    def test_approve_with_feedback_and_remember_and_rule_management(self):
+        from agentlab.providers import ScriptedProvider
+
+        def run(session, call, answer):
+            provider = ScriptedProvider([ModelResponse("", [call]), ModelResponse(answer)])
+            with patch.object(self.app, "_provider", return_value=provider):
+                submitted = self.request("POST", "/api/run", {"prompt": "go", "session_id": session})[1]
+                first = self.wait_job(submitted["job_id"])
+                return provider, first
+
+        shell = lambda command, call_id: ToolCall("run_shell", {"command": command}, call_id)
+        # 拒绝并给出理由：模型能看到理由。
+        provider, first = run("fb", shell("printf one", "s1"), "好")
+        pending = self.request("GET", "/api/sessions/fb")[1]["pending"][0]
+        self.assertEqual((pending["risk"], pending["needs_approval"], pending["auto_approved"]), ("exec", True, False))
+        self.assertEqual(pending["preview"]["kind"], "command")
+        self.assertEqual(pending["suggested_rule"]["match"], {"kind": "command_prefix", "prefix": ["printf"]})
+        for bad in ({"approved_call_ids": [], "feedback": 5}, {"approved_call_ids": [], "feedback": "x" * 2001},
+                    {"approved_call_ids": [], "remember": "forever"}):
+            self.assertEqual(self.request("POST", "/api/sessions/fb/approve", bad)[0], 400, bad)
+        with patch.object(self.app, "_provider", return_value=provider):
+            denied = self.request("POST", "/api/sessions/fb/approve",
+                                  {"approved_call_ids": [], "feedback": "别执行命令，直接告诉我结果"})[1]
+            self.assertEqual(self.wait_job(denied["job_id"])["result"]["status"], "completed")
+        tool_message = next(m for m in self.request("GET", "/api/sessions/fb")[1]["messages"] if m["role"] == "tool")
+        self.assertIn("别执行命令", json.loads(tool_message["content"])["error"])
+        # 批准并全局记住：新会话里同类命令自动放行；撤销后恢复询问。
+        provider, first = run("gl", shell("printf two", "s2"), "好")
+        with patch.object(self.app, "_provider", return_value=provider):
+            approved = self.request("POST", "/api/sessions/gl/approve",
+                                    {"approved_call_ids": ["s2"], "remember": "global"})[1]
+            self.assertEqual(self.wait_job(approved["job_id"])["result"]["status"], "completed")
+        rules = self.request("GET", "/api/approval/rules")[1]
+        self.assertEqual(rules["mode"], "ask")
+        (rule,) = rules["rules"]
+        provider, second = run("gl2", shell("printf three", "s3"), "好")
+        self.assertEqual(second["result"]["status"], "completed")
+        pending = self.request("POST", "/api/approval/rules/delete", {"id": rule["id"]})[1]
+        self.assertEqual(pending, {"rules": []})
+        self.assertEqual(self.request("POST", "/api/approval/rules/delete", {"id": rule["id"]})[0], 404)
+        self.assertEqual(self.request("POST", "/api/approval/rules/delete", {})[0], 400)
+        provider, third = run("gl3", shell("printf four", "s4"), "好")
+        self.assertEqual(third["result"]["status"], "waiting_approval")
+        # 会话级规则：写入会话，可以在会话里看到并撤销。
+        with patch.object(self.app, "_provider", return_value=provider):
+            ok = self.request("POST", "/api/sessions/gl3/approve", {"approved_call_ids": ["s4"], "remember": "session"})[1]
+            self.wait_job(ok["job_id"])
+        session_rule = self.request("GET", "/api/sessions/gl3")[1]["approval_rules"][0]
+        self.assertEqual(self.request("POST", "/api/sessions/gl3/rules/delete", {"id": "nope"})[0], 404)
+        self.assertEqual(self.request("POST", "/api/sessions/gl3/rules/delete", {"id": session_rule["id"]})[0], 200)
+        self.assertEqual(self.request("GET", "/api/sessions/gl3")[1]["approval_rules"], [])
+
     def test_delete_session_via_api(self):
         submitted = self.request("POST", "/api/run", {"prompt": "/calc 1 + 1", "session_id": "gone"})[1]
         self.wait_job(submitted["job_id"])
         self.assertEqual(self.request("POST", "/api/sessions/gone/delete")[1], {"deleted": "gone"})
         self.assertEqual(self.request("GET", "/api/sessions/gone")[0], 404)
         self.assertEqual(self.request("POST", "/api/sessions/gone/delete")[0], 404)
+
+    def test_ask_user_question_can_be_answered_through_api(self):
+        from agentlab.providers import ScriptedProvider
+        ask = ToolCall("ask_user", {"question": "用哪个端口？", "options": ["80", "8080"]}, "q1")
+        todos = ToolCall("todo_write", {"todos": [{"content": "选端口", "status": "in_progress"}]}, "t1")
+        provider = ScriptedProvider([ModelResponse("", [todos, ask]), ModelResponse("用 8080 启动。")])
+        with patch.object(self.app, "_provider", return_value=provider):
+            submitted = self.request("POST", "/api/run", {"prompt": "部署", "session_id": "asking"})[1]
+            first = self.wait_job(submitted["job_id"])
+            self.assertEqual(first["result"]["status"], "waiting_input")
+            state = self.request("GET", "/api/sessions/asking")[1]
+            self.assertEqual(state["status"], "waiting_input")
+            self.assertEqual(state["todos"], [{"content": "选端口", "status": "in_progress"}])
+            self.assertEqual([(c["id"], c["interactive"], c["needs_approval"]) for c in state["pending"]],
+                             [("q1", True, False)])
+            for bad in ({}, {"call_id": "q1"}, {"call_id": "q1", "answer": "  "}, {"call_id": 1, "answer": "x"}):
+                self.assertEqual(self.request("POST", "/api/sessions/asking/answer", bad)[0], 400, bad)
+            # 提问期间不能开新任务，也不能走审批通道。
+            blocked = self.request("POST", "/api/run", {"prompt": "另一件事", "session_id": "asking"})[1]
+            self.assertEqual(self.wait_job(blocked["job_id"])["status"], "failed")
+            wrong = self.request("POST", "/api/sessions/asking/answer", {"call_id": "nope", "answer": "x"})[1]
+            self.assertEqual(self.wait_job(wrong["job_id"])["status"], "failed")
+            answered = self.request("POST", "/api/sessions/asking/answer", {"call_id": "q1", "answer": "8080"})[1]
+            done = self.wait_job(answered["job_id"])
+        self.assertEqual((done["status"], done["result"]["status"]), ("completed", "completed"))
+        self.assertEqual(done["result"]["output"], "用 8080 启动。")
+        self.assertEqual(self.request("GET", "/api/sessions/asking")[1]["pending"], [])
+        tool = next(x for x in self.request("GET", "/api/bootstrap")[1]["tools"] if x["function"]["name"] == "git")
+        self.assertTrue(tool["conditional_approval"])
+        self.assertFalse(tool["interactive"])
 
     def test_config_key_is_memory_only_and_configuration_makes_no_model_request(self):
         key = "sk-fake-server-test-secret"

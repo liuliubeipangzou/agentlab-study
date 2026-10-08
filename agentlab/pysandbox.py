@@ -117,6 +117,8 @@ def _child_environment():
     env = {name: os.environ[name] for name in _ENV_ALLOWLIST if name in os.environ}
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # 命令行工具无人值守：不弹分页器、不等终端输入、不输出颜色控制符。
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_PAGER="cat", PAGER="cat", NO_COLOR="1", CI="1")
     # 明确移除可能影响子进程行为的变量。
     for name in ("PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
                  "AGENTLAB_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY",
@@ -230,6 +232,38 @@ async def _capture_stream(stream, limit):
             chunks.append(prefix)
             kept += len(prefix)
     return b"".join(chunks), total > kept
+
+
+async def _capture_ends(stream, head_limit, tail_limit):
+    """持续排空管道，保留开头与滚动的结尾，内存占用有界。
+
+    命令的报错与汇总行几乎总在输出末尾，只保存前缀会恰好丢掉最需要的部分。
+    返回 (开头字节, 结尾字节, 总字节数)；两者之间被省略的部分 = 总数 - 开头 - 结尾。
+    """
+    head, tail, total = bytearray(), bytearray(), 0
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        room = head_limit - len(head)
+        if room > 0:
+            head += chunk[:room]
+            chunk = chunk[room:]
+        if chunk:
+            tail += chunk
+            if len(tail) > tail_limit * 2:  # 摊销裁剪，避免每个分片都移动缓冲区
+                del tail[:len(tail) - tail_limit]
+    if len(tail) > tail_limit:
+        del tail[:len(tail) - tail_limit]
+    return bytes(head), bytes(tail), total
+
+
+def _join_ends(head, tail, omitted):
+    text = head.decode("utf-8", "replace")
+    if omitted > 0:
+        text += "\n…（中间省略 %d 字节）…\n" % omitted
+    return text + tail.decode("utf-8", "replace")
 
 
 async def _wait_and_clean_group(process):
@@ -378,8 +412,26 @@ def _clip(text, limit):
     return text[:limit] + "\n…（输出已截断，原始 %d 字符）" % len(text)
 
 
+def clip_ends(text, limit):
+    """超长输出保留开头和结尾：命令的报错与汇总行通常在末尾，只留前缀会丢掉最关键的部分。"""
+    if len(text) <= limit:
+        return text
+    head = limit // 3
+    tail = limit - head
+    return "%s\n…（中间省略 %d 字符）…\n%s" % (text[:head], len(text) - limit, text[-tail:])
+
+
 def _kill_group(process):
-    """终止整个进程组；失败时退化为终止单个进程。"""
+    """终止整个进程组；失败时退化为终止单个进程。
+
+    先 SIGSTOP 冻结整组，再 SIGKILL。直接 SIGKILL 不是原子的：信号逐个投递，先被杀死的子进程会让
+    父 shell 收到 SIGCHLD，在它自己被杀之前的几微秒里继续执行下一条命令。`sh -c "pytest; rm -rf build"`
+    超时时，这个窗口足以让 `rm -rf build` 跑起来。冻结后没有任何成员能再执行，SIGKILL 对已停止的进程同样有效。
+    """
+    try:
+        os.killpg(process.pid, signal.SIGSTOP)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass  # 进程组已经不存在或无权冻结：照常尝试终止
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
@@ -387,3 +439,107 @@ def _kill_group(process):
             process.kill()
         except ProcessLookupError:
             pass
+
+
+MAX_COMMAND_TIMEOUT = 600.0
+
+
+async def run_command(command, cwd, timeout=120.0, memory_mb=2048, max_output_chars=MAX_OUTPUT_CHARS,
+                      shell=False, stdin_text=None):
+    """在工作区内运行一个命令，返回退出码与有界的 stdout/stderr。
+
+    与 run_python 共享同样的约束：独立进程组、超时后整组终止、RSS 看门狗、净化后的环境、
+    输出有界排空。shell=True 时 command 是交给 /bin/sh -c 的字符串，否则是参数列表（不经 shell）。
+    它不是沙箱：命令以当前用户身份运行，可读写文件、访问网络。
+    """
+    if os.name != "posix":
+        raise RuntimeError("命令执行器需要 POSIX 进程组支持")
+    if shell:
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("command 不能为空")
+        argv = ["/bin/sh", "-c", command]
+    else:
+        if (not isinstance(command, (list, tuple)) or not command
+                or any(not isinstance(item, str) or "\x00" in item for item in command)):
+            raise ValueError("command 必须是非空字符串列表")
+        argv = list(command)
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= MAX_COMMAND_TIMEOUT:
+        raise ValueError("timeout 必须是不超过 %s 的正数" % MAX_COMMAND_TIMEOUT)
+    if type(memory_mb) is not int or not 64 <= memory_mb <= MAX_MEMORY_MB:
+        raise ValueError("memory_mb 必须在 64 到 %d 之间" % MAX_MEMORY_MB)
+    if type(max_output_chars) is not int or not 128 <= max_output_chars <= 200000:
+        raise ValueError("max_output_chars 必须在 128 到 200000 之间")
+    workdir = str(Path(cwd).expanduser().resolve())
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    process, watchdog, completion = None, None, None
+    tasks = []
+    try:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv, stdin=asyncio.subprocess.PIPE if stdin_text is not None else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                cwd=workdir, env=_child_environment(), start_new_session=True)
+        except FileNotFoundError:
+            return {"ok": False, "exit_code": 127, "stdout": "", "stderr": "", "timed_out": False,
+                    "truncated": False, "duration": 0.0, "error": "找不到可执行文件：" + argv[0]}
+        watchdog = asyncio.create_task(_memory_watchdog(process, memory_mb * 1024 * 1024))
+        head = max_output_chars // 3
+        tasks = [asyncio.create_task(_capture_ends(process.stdout, head, max_output_chars - head)),
+                 asyncio.create_task(_capture_ends(process.stderr, head, max_output_chars - head)),
+                 asyncio.create_task(_wait_and_clean_group(process))]
+        completion = asyncio.gather(*tasks)
+        if stdin_text is not None:
+            try:
+                process.stdin.write(stdin_text.encode("utf-8"))
+                await process.stdin.drain()
+                process.stdin.close()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # 命令没有读完输入就退出了，退出码与输出会说明原因。
+        timed_out = False
+        try:
+            captured = await asyncio.wait_for(asyncio.shield(completion), timeout=timeout)
+        except asyncio.TimeoutError:
+            timed_out = True
+            _kill_group(process)
+            captured = await asyncio.wait_for(asyncio.shield(completion), timeout=5)
+        if not watchdog.done():
+            watchdog.cancel()
+        outcome = (await asyncio.gather(watchdog, return_exceptions=True))[0]
+        killed_for_memory = outcome is True
+        (out_head, out_tail, out_total), (err_head, err_tail, err_total), exit_code = captured
+        out_omitted = out_total - len(out_head) - len(out_tail)
+        err_omitted = err_total - len(err_head) - len(err_tail)
+        result = {"ok": exit_code == 0 and not timed_out and not killed_for_memory,
+                  "exit_code": exit_code,
+                  "stdout": _join_ends(out_head, out_tail, out_omitted),
+                  "stderr": _join_ends(err_head, err_tail, err_omitted),
+                  "timed_out": timed_out and not killed_for_memory,
+                  "truncated": out_omitted > 0 or err_omitted > 0,
+                  "duration": round(loop.time() - started, 3)}
+        if killed_for_memory:
+            result.update(error="命令内存占用超过 %d MiB 上限，已终止进程组" % memory_mb, limit_exceeded="memory")
+        elif timed_out:
+            result["error"] = "命令执行超过 %.1f 秒，已终止进程组" % timeout
+        elif exit_code != 0:
+            result["error"] = "命令以退出码 %s 结束" % exit_code
+        return result
+    finally:
+        if process is not None:
+            _kill_group(process)
+        if watchdog is not None and not watchdog.done():
+            watchdog.cancel()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if watchdog is not None:
+            await asyncio.gather(watchdog, return_exceptions=True)
+        if completion is not None:
+            await asyncio.gather(completion, return_exceptions=True)
+        if process is not None:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except (Exception, asyncio.CancelledError):
+                pass

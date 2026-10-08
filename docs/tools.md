@@ -56,6 +56,24 @@ POSIX 文件操作使用 `dir_fd`、`O_NOFOLLOW` 和逐层目录描述符；工�
 进程恶意重命名已打开的目录、改变挂载点或预先设置硬链接，也不是操作系统沙箱。
 缺少 POSIX `O_NOFOLLOW` / `dir_fd` 支持的系统会明确拒绝文件工具，其他工具仍可使用。
 
+### 为干活准备的文件与命令工具
+
+| 工具 | 行为要点 |
+| --- | --- |
+| `read_file` | 不带 `offset`/`limit` 保持原样：整文件字符串，超过 256 KiB 报错并提示分页。带任一参数则按行分页，返回带行号的 `content`、`total_lines` 与 `next_offset`，文件上限 8 MiB；一页的大小会按 `max_output_chars` 自动收敛，避免被截断成难读的 JSON 预览 |
+| `write_file` / `append_file` | 原子写入，**保留已有文件的权限位**（新文件为 0600）。`append_file` 让长内容可以分多次写，避开单次输出被截断 |
+| `edit_file` | `old_string` 必须与原文完全一致且唯一，否则报错并给出出现次数与行号；`replace_all` 替换全部。返回 unified diff。文件上限 2 MiB |
+| `glob` | 支持 `**`、`?`、`[...]`、`{a,b}`；不含 `/` 的模式匹配任意深度的文件名。跳过符号链接、`.git`、`node_modules`、`__pycache__`、虚拟环境与缓存目录，遍历上限 20000 项 |
+| `grep` | 默认正则，`fixed=true` 为字面搜索，可带 `glob`、`ignore_case`、`context`。**在独立子进程里执行**（20 秒时限）：线程无法中断，模型给出的 `(a+)+$` 这类灾难性回溯正则会让线程空转到进程退出，子进程则可以被杀掉 |
+| `run_shell` | 经 `pysandbox.run_command`：独立进程组、超时后整组终止、RSS 看门狗、净化环境（密钥与代理变量不传入，`GIT_TERMINAL_PROMPT=0`、`PAGER=cat` 避免挂起）。stdout/stderr 同时保留**开头与结尾**——报错和汇总行几乎总在末尾。非零退出码表现为 `ok: false`，退出码和两个输出流放在 `details` 里，并按预算共享，失败时不会只剩开头的 2000 字符 |
+| `git` | `args` 是参数列表，不经 shell。只读子命令（status、diff、log、show、blame、ls-files、rev-parse 等，以及 `branch` 的列表形式、`tag -l`、`stash list` 等）免审批；其余需要审批。拒绝 `-c`/`-C`/`--git-dir` 等全局选项与 `--upload-pack`/`--exec` 等能替换执行程序的选项；`--output`、`--ext-diff`、`--textconv` 即使在只读子命令上也要审批 |
+| `todo_write` | 整体替换会话待办，存入会话状态、发 `todos_updated` 事件，并在每次调用时附在系统提示里，上下文被摘要后也不会丢 |
+| `ask_user` | 交互式工具（`Tool.interactive=True`），不由注册表执行：Agent 遇到它会进入 `waiting_input`，用户回答后作为工具结果交给模型 |
+
+**受保护路径**：文件工具拒绝 `.git/` 下的一切与 `.env`、`.env.*`（`.env.example`、`.env.sample`、`.env.template`、`.env.dist` 除外）。通过 `tool_settings={"protected_paths": ["*.pem"]}` 追加 fnmatch 模式。这只约束文件工具；`run_shell`、`run_python` 以你的权限运行，不受限制。
+
+`ToolContext` 现在带有 `state`（当前会话的可变状态）和 `emit`（发事件）两个由 Agent 填充的字段，供 `todo_write` 这类需要读写会话状态的内置工具使用；单独使用注册表时它们为 `None`。
+
 ## 超时与取消
 
 协作式 async 处理器会由 `asyncio.wait_for` 取消。处理器应在耗时操作中使用真正

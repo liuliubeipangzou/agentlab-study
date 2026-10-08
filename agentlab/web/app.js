@@ -4,10 +4,14 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const state = {csrf: null, config: null, tools: [], view: "chat", inspector: "trace", sessions: [], currentId: null, current: null, cache: new Map(), jobs: new Map(), drafts: new Map(), chatNotice: "", chatEpoch: 0, sending: false, approving: false, cancelling: false, polling: false, online: false, ready: false, lastRefresh: 0, messageStamp: "", inspectorStamp: "", approvalStamp: "", recoveryStamp: "", files: [], fileStamp: "", lesson: "learning-path.md", lessonEpoch: 0, knowledgeEpoch: 0};
 const titles = {chat: "对话工作台", knowledge: "知识库", files: "工作区文件", tools: "工具箱", learning: "学习路径", lab: "协作实验", settings: "设置"};
-const statuses = {running: "运行中", completed: "已完成", waiting_approval: "等待审批", failed: "运行失败", cancelled: "已停止", limited: "达到限制", pending: "等待开始", success: "已完成", skipped: "已跳过"};
+const statuses = {running: "运行中", completed: "已完成", waiting_approval: "等待审批", waiting_input: "等待回答", failed: "运行失败", cancelled: "已停止", limited: "达到限制", pending: "等待开始", success: "已完成", skipped: "已跳过"};
 const lessons = [["learning-path.md", "从零开始", "学习地图与第一个 Agent"], ["architecture.md", "理解执行循环", "消息、模型与工具如何协作"], ["tools.md", "赋予 Agent 能力", "工具协议、权限和安全边界"], ["memory-workflows.md", "记忆与多步协作", "知识检索、会话记忆与 DAG"], ["providers.md", "接入真实模型", "兼容接口、工具调用与重试"], ["operations.md", "让系统稳定运行", "审批、恢复、配置与运维"], ["validation.md", "验证你的 Agent", "回归测试与可复现的检查"]];
-const eventNames = {run_started: "开始处理任务", model_started: "调用模型", model_finished: "模型返回响应", tool_started: "开始执行工具", tool_finished: "工具执行完成", approval_requested: "等待你的批准", approval_resolved: "审批决定已提交", run_completed: "任务已完成", run_failed: "任务运行失败", run_cancelled: "任务已停止", run_limited: "达到运行限制", run_waiting_approval: "已暂停，等待审批"};
-const toolInfo = {calculator: ["计算器", "terminal", "blue", "通过受限表达式完成数学计算。", "/calc (20 + 1) * 2"], read_file: ["文件读取", "file", "blue", "读取工作区内的 UTF-8 文本文件。", "/read notes/day1.txt"], write_file: ["文件写入", "file", "amber", "创建学习笔记，写入前由你确认。", "/write notes/day1.txt 今天学会了工具调用"], search_knowledge: ["知识检索", "search", "purple", "从本地资料中查找相关知识片段。", "/search Agent 记忆"], remember: ["保存记忆", "book", "green", "把重要信息保存在当前会话中。", "/remember goal 掌握Agent执行循环"], recall: ["回忆信息", "book", "purple", "按关键词查询这个会话的长期记忆。", "/recall goal"]};
+const eventNames = {run_started: "开始处理任务", model_started: "调用模型", model_finished: "模型返回响应", tool_started: "开始执行工具", tool_finished: "工具执行完成", approval_requested: "等待你的批准", approval_resolved: "审批决定已提交", run_completed: "任务已完成", run_failed: "任务运行失败", run_cancelled: "任务已停止", run_limited: "达到运行限制", run_waiting_approval: "已暂停，等待审批", run_waiting_input: "已暂停，等待你的回答", input_requested: "Agent 向你提问", input_provided: "回答已提交", todos_updated: "更新待办清单", tools_changed: "工具集已变化，待审批操作被取消", model_retry: "模型输出无效，正在重试", context_summarized: "较早的对话已摘要压缩"};
+const toolInfo = {calculator: ["计算器", "terminal", "blue", "通过受限表达式完成数学计算。", "/calc (20 + 1) * 2"], read_file: ["文件读取", "file", "blue", "读取工作区内的 UTF-8 文本文件。", "/read notes/day1.txt"], write_file: ["文件写入", "file", "amber", "创建学习笔记，写入前由你确认。", "/write notes/day1.txt 今天学会了工具调用"], search_knowledge: ["知识检索", "search", "purple", "从本地资料中查找相关知识片段。", "/search Agent 记忆"], remember: ["保存记忆", "book", "green", "把重要信息保存在当前会话中。", "/remember goal 掌握Agent执行循环"], recall: ["回忆信息", "book", "purple", "按关键词查询这个会话的长期记忆。", "/recall goal"],
+  edit_file: ["精确编辑", "file", "amber", "对已有文件做精确替换并返回 diff，修改前由你确认。", ""], append_file: ["追加写入", "file", "amber", "在文件末尾追加内容，适合分段写长文件。", ""],
+  glob: ["查找文件", "search", "blue", "按 **/*.py 之类的模式查找文件，自动跳过依赖与缓存目录。", ""], grep: ["搜索内容", "search", "purple", "在工作区文件中搜索文本，返回路径与行号。", ""],
+  run_shell: ["执行命令", "terminal", "amber", "运行测试、构建或命令行工具，执行前由你确认命令。", ""], git: ["Git", "terminal", "blue", "查看状态与差异无需确认；提交、切换分支等会修改仓库的操作需要确认。", ""],
+  now: ["当前时间", "terminal", "green", "获取当前日期、时间与时区。", ""], todo_write: ["任务清单", "book", "green", "把多步任务拆成清单并随进度更新，显示在对话上方。", ""], ask_user: ["向你提问", "spark", "purple", "缺少关键信息时暂停并询问你，回答后继续。", ""]};
 
 function el(tag, className, text) { const value = document.createElement(tag); if (className) value.className = className; if (text !== undefined && text !== null) value.textContent = String(text); return value; }
 function icon(name, extra = "") { const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg"), use = document.createElementNS("http://www.w3.org/2000/svg", "use"); svg.setAttribute("class", "icon " + extra); svg.setAttribute("aria-hidden", "true"); use.setAttribute("href", "#i-" + name); svg.append(use); return svg; }
@@ -100,6 +104,8 @@ function applyConfig(config) {
   $("#api-key-status").textContent = config.has_api_key ? "本次启动已设置" : "未设置"; $("#settings-saved-status").textContent = "已保存 · " + (demo ? "演示模式" : "真实模型");
   $("#config-provider").value = config.provider || "openai"; $("#config-model").value = config.model || "deepseek-flash"; $("#config-base-url").value = config.base_url || "https://api.deepseek.com";
   if (config.streaming !== undefined) { const streaming = $("#config-streaming"); if (streaming) streaming.checked = config.streaming !== false; }
+  const modeSelect = $("#config-approval-mode"); if (modeSelect && config.approval_mode) { modeSelect.value = config.approval_mode; $("#config-trust-ack").checked = config.approval_mode === "trust"; updateApprovalModeHelp(); }
+  const defaultCommands = $("#default-commands"); if (defaultCommands) defaultCommands.textContent = (config.default_commands || []).join("、");
   ["max_steps", "max_tool_calls", "max_total_tokens", "run_timeout"].forEach(name => { const input = $("#budget-" + name); if (!input) return; const saved = (config.budgets || {})[name]; input.value = saved === undefined ? "" : String(saved); const fallback = (config.budget_defaults || {})[name]; input.placeholder = fallback === undefined ? "默认" : "默认 " + fallback; });
   if (config.search_backend !== undefined) $("#config-search-backend").value = config.search_backend || "";
   if (config.has_search_key !== undefined) $("#search-key-status").textContent = config.has_search_key ? "已设置" : "(可选，留空使用免密钥后端)";
@@ -135,8 +141,9 @@ async function refreshCurrent(id = state.currentId, epoch = state.chatEpoch) {
 function currentJob() { return [...state.jobs.values()].find(job => job.kind === "run" && job.sessionId === state.currentId && job.status === "running"); }
 function running() { return state.sending || Boolean(currentJob()) || Boolean(state.current && state.current.active); }
 function pending() { return state.current && state.current.status === "waiting_approval"; }
+function asking() { return Boolean(state.current && state.current.status === "waiting_input"); }
 function recovery() { return Boolean(state.current && state.current.status === "running" && !state.current.active && !currentJob() && !state.sending); }
-function writeCall(call) { if (typeof call.needs_approval === "boolean") return call.needs_approval; const definition = state.tools.find(tool => (tool.function || tool).name === call.name); return definition && definition.risk ? definition.risk === "write" : ["write_file", "remember"].includes(call.name); }
+function writeCall(call) { if (typeof call.needs_approval === "boolean") return call.needs_approval; const definition = state.tools.find(tool => (tool.function || tool).name === call.name); return definition && definition.risk ? definition.risk !== "read" : ["write_file", "remember"].includes(call.name); }
 function callMap(messages) { const map = new Map(); messages.forEach(message => (message.tool_calls || []).forEach(call => map.set(call.id, call))); return map; }
 function readableValue(value, host, toolName) {
   if (typeof value === "number") { host.append(el("p", "answer-result", "计算结果：" + value)); return; }
@@ -173,7 +180,7 @@ function renderChat() {
     });
     preserve($("#message-list"), children); show($("#welcome"), !visible.length && !state.currentId); if (nearBottom || visible.length <= 1) requestAnimationFrame(() => { scroller.scrollTop = scroller.scrollHeight; });
   }
-  const active = running(), waiting = pending(), interrupted = recovery(), host = $("#run-state"); host.classList.remove("error");
+  const active = running(), waiting = pending(), questioning = asking(), interrupted = recovery(), host = $("#run-state"); host.classList.remove("error");
   if (active) { host.replaceChildren(el("span", "loading-dot"), document.createTextNode("Agent 正在处理任务，右侧可查看执行进展…")); show(host, true); }
   else if (session && ["failed", "limited", "cancelled"].includes(session.status)) {
     host.textContent = session.output || statuses[session.status]; host.classList.toggle("error", session.status === "failed");
@@ -183,18 +190,67 @@ function renderChat() {
   }
   else if (state.chatNotice) { host.textContent = state.chatNotice; host.classList.add("error"); show(host, true); }
   else show(host, false);
-  renderApproval(); renderRecovery();
-  const disabled = !state.ready || active || waiting || interrupted || state.approving; $("#prompt").disabled = disabled; $("#send-message").disabled = disabled || !$("#prompt").value.trim(); show($("#cancel-run"), Boolean(currentJob())); $("#cancel-run").disabled = state.cancelling;
-  $("#prompt").placeholder = waiting ? "请先批准或拒绝上方工具调用，再继续对话…" : interrupted ? "请先恢复中断的会话状态…" : "向 Agent 提出问题，或选择上方示例开始…";
-  $("#composer-status").textContent = waiting ? "等待你确认工具操作" : interrupted ? "检测到中断的运行" : active ? "运行中 · 任务在切换页面后继续" : state.currentId ? "可以继续这段对话" : "一切就绪，开始你的第一个实验";
+  renderApproval(); renderQuestion(); renderTodos(); renderRecovery();
+  const disabled = !state.ready || active || waiting || questioning || interrupted || state.approving; $("#prompt").disabled = disabled; $("#send-message").disabled = disabled || !$("#prompt").value.trim(); show($("#cancel-run"), Boolean(currentJob())); $("#cancel-run").disabled = state.cancelling;
+  $("#prompt").placeholder = waiting ? "请先批准或拒绝上方工具调用，再继续对话…" : questioning ? "请先在上方回答 Agent 的问题…" : interrupted ? "请先恢复中断的会话状态…" : "向 Agent 提出问题，或选择上方示例开始…";
+  $("#composer-status").textContent = waiting ? "等待你确认工具操作" : questioning ? "等待你回答问题" : interrupted ? "检测到中断的运行" : active ? "运行中 · 任务在切换页面后继续" : state.currentId ? "可以继续这段对话" : "一切就绪，开始你的第一个实验";
+}
+// 预览：diff 按行着色（只用文本节点，不拼 HTML），命令和代码原样显示。
+function previewBlock(preview) {
+  const box = el("div", "approval-preview"), title = el("p", "approval-preview-title", preview.title || ""); box.append(title);
+  const pre = el("pre", "code-block preview-" + preview.kind);
+  if (preview.kind === "diff") (preview.text || "").split("\n").forEach(line => pre.append(el("span", "diff-line " + (line.startsWith("+++") || line.startsWith("---") ? "diff-file" : line.startsWith("@@") ? "diff-hunk" : line.startsWith("+") ? "diff-add" : line.startsWith("-") ? "diff-del" : ""), line + "\n")));
+  else pre.textContent = preview.text || "";
+  box.append(pre); return box;
 }
 function renderApproval() {
   const calls = pending() ? state.current.pending || [] : [], stamp = JSON.stringify([state.currentId, calls, state.approving]); if (stamp === state.approvalStamp) return; state.approvalStamp = stamp;
   const host = $("#approval-host"); if (!calls.length) { host.replaceChildren(); return; }
-  const selected = new Set($$("input[data-call-id]:checked", host).map(input => input.dataset.callId)), hadChoices = Boolean($("input[data-call-id]", host)), card = el("section", "approval-card"), heading = el("div", "approval-heading");
-  heading.append(icon("check"), el("h3", "", "这个操作需要你的确认")); card.append(heading, el("p", "muted", "检查参数后再继续。未勾选的写入操作会被拒绝，普通读取工具会按计划执行。"));
-  calls.forEach(call => { const item = el("div", "approval-item"), title = el("label", "approval-tool-label"); if (writeCall(call)) { const checkbox = el("input"); checkbox.type = "checkbox"; checkbox.dataset.callId = call.id; checkbox.checked = hadChoices ? selected.has(call.id) : true; checkbox.disabled = state.approving; title.append(checkbox, el("strong", "", call.name), badge("需要批准", "warning")); } else title.append(el("strong", "", call.name), badge("读取操作")); item.append(title, el("pre", "code-block", pretty(call.arguments))); card.append(item); });
-  const actions = el("div", "approval-actions"), buttons = [button("批准所选并继续", "button primary", guarded(() => approve($$("input[data-call-id]:checked", host).map(input => input.dataset.callId)))), button("全部批准", "button secondary", guarded(() => approve(calls.filter(writeCall).map(call => call.id)))), button("全部拒绝", "button ghost danger", guarded(() => approve([])))]; buttons.forEach(value => { value.disabled = state.approving; actions.append(value); }); card.append(actions); host.replaceChildren(card);
+  // 重绘时保留用户已经做的选择：勾选、记住范围、拒绝理由。
+  const selected = new Set($$("input[data-call-id]:checked", host).map(input => input.dataset.callId)), hadChoices = Boolean($("input[data-call-id]", host));
+  const keepScope = ($("select.remember-scope", host) || {}).value || "", keepReason = ($("input.deny-reason", host) || {}).value || "";
+  const card = el("section", "approval-card"), heading = el("div", "approval-heading"), asked = calls.filter(writeCall);
+  heading.append(icon("check"), el("h3", "", asked.length > 1 ? "有 " + asked.length + " 个操作需要你的确认" : "这个操作需要你的确认")); card.append(heading, el("p", "muted", "检查改动后再继续。未勾选的操作会被拒绝；只读操作会按计划执行。"));
+  calls.forEach(call => {
+    const item = el("div", "approval-item"), title = el("label", "approval-tool-label");
+    if (writeCall(call)) { const checkbox = el("input"); checkbox.type = "checkbox"; checkbox.dataset.callId = call.id; checkbox.checked = hadChoices ? selected.has(call.id) : true; checkbox.disabled = state.approving; title.append(checkbox, el("strong", "", call.name), badge(riskNames[call.risk] || "需要批准", riskTone[call.risk] || "warning")); item.append(title, previewBlock(call.preview || {kind: "json", title: call.name, text: pretty(call.arguments)})); }
+    else if (call.auto_approved) { title.append(el("strong", "", call.name), badge("已自动放行", "success"), badge(riskNames[call.risk] || "", riskTone[call.risk] || "subtle")); item.append(title); }
+    else { title.append(el("strong", "", call.name), badge("读取操作")); item.append(title); }
+    card.append(item);
+  });
+  const suggestion = (asked.find(call => call.suggested_rule) || {}).suggested_rule;
+  if (suggestion) { const row = el("div", "approval-remember"), select = el("select", "remember-scope"); select.disabled = state.approving; row.append(el("label", "", "批准后："));
+    [["", "仅这一次"], ["session", "本会话总是允许 " + suggestion.label], ["global", "所有会话总是允许 " + suggestion.label]].forEach(([value, text]) => { const option = el("option", "", text); option.value = value; option.selected = value === keepScope; select.append(option); }); row.append(select); card.append(row); }
+  const reason = el("input", "deny-reason"); reason.type = "text"; reason.maxLength = 2000; reason.placeholder = "拒绝时可以告诉 Agent 原因或改法（可选）"; reason.value = keepReason; reason.disabled = state.approving; card.append(reason);
+  const scope = () => { const select = $("select.remember-scope", card); return select && select.value ? select.value : undefined; }, why = () => reason.value.trim() || undefined;
+  const run = ids => approve(ids, {remember: ids.length ? scope() : undefined, feedback: why()});
+  const actions = el("div", "approval-actions"), buttons = [button("批准所选并继续", "button primary", guarded(() => run($$("input[data-call-id]:checked", card).map(input => input.dataset.callId)))), button("全部批准", "button secondary", guarded(() => run(asked.map(call => call.id)))), button("全部拒绝", "button ghost danger", guarded(() => approve([], {feedback: why()})))]; buttons.forEach(value => { value.disabled = state.approving; actions.append(value); }); card.append(actions); host.replaceChildren(card); revealCard(card);
+}
+function renderQuestion() {
+  const calls = asking() ? (state.current.pending || []).filter(call => call.interactive || call.name === "ask_user") : [], stamp = JSON.stringify([state.currentId, calls, state.approving]); if (stamp === state.questionStamp) return; state.questionStamp = stamp;
+  const host = $("#question-host"), draft = $("input.question-input", host); if (!calls.length) { host.replaceChildren(); return; }
+  const keep = draft ? draft.value : "", call = calls[0], args = call.arguments || {}, card = el("section", "approval-card question-card"), heading = el("div", "approval-heading");
+  heading.append(icon("info"), el("h3", "", "Agent 想向你确认一件事")); card.append(heading, el("p", "question-text", args.question || ""));
+  const send = text => guarded(() => answerQuestion(call.id, text));
+  if (Array.isArray(args.options) && args.options.length) { const options = el("div", "approval-actions"); args.options.forEach(option => { const choice = button(option, "button secondary", send(option)); choice.disabled = state.approving; options.append(choice); }); card.append(options); }
+  const row = el("div", "approval-actions"), input = el("input", "question-input"); input.type = "text"; input.maxLength = 8000; input.placeholder = "输入你的回答…"; input.value = keep; input.disabled = state.approving;
+  const submit = button("回复", "button primary", guarded(() => { const text = input.value.trim(); if (!text) { toast("请先输入回答。", "error"); return; } return answerQuestion(call.id, text); })); submit.disabled = state.approving;
+  input.addEventListener("keydown", event => { if (event.key === "Enter" && !event.isComposing) { event.preventDefault(); submit.click(); } });
+  row.append(input, submit); card.append(row); host.replaceChildren(card); revealCard(card);
+}
+// 卡片出现在可滚动的消息区底部，不主动滚动的话用户只会看到一条边，错过 Agent 的提问。
+function revealCard(card) { requestAnimationFrame(() => { if (card.isConnected && card.scrollIntoView) card.scrollIntoView({block: "nearest"}); }); }
+async function answerQuestion(callId, text) {
+  if (state.approving || !state.currentId) return; const id = state.currentId; state.approving = true; renderChat();
+  try { const result = await api("/api/sessions/" + encodeURIComponent(id) + "/answer", {call_id: callId, answer: text}); trackJob(result.job_id, "run", result.session_id || id); if (id === state.currentId) await refreshCurrent(); toast("已提交回答，Agent 将继续。", "success"); }
+  finally { state.approving = false; state.questionStamp = ""; renderChat(); }
+}
+function renderTodos() {
+  const todos = state.current && Array.isArray(state.current.todos) ? state.current.todos : [], stamp = JSON.stringify([state.currentId, todos]); if (stamp === state.todoStamp) return; state.todoStamp = stamp;
+  const host = $("#todo-host"); if (!todos.length) { host.replaceChildren(); return; }
+  const done = todos.filter(item => item.status === "completed").length, card = el("section", "todo-card"), head = el("div", "todo-heading"), list = el("ul", "todo-list");
+  head.append(el("strong", "", "任务清单"), el("span", "muted", done + " / " + todos.length + " 已完成")); card.append(head);
+  todos.forEach(item => { const row = el("li", "todo-item " + item.status); row.append(el("span", "todo-mark", item.status === "completed" ? "✓" : item.status === "in_progress" ? "▶" : "○"), el("span", "todo-text", item.content)); list.append(row); }); card.append(list); host.replaceChildren(card);
 }
 function renderRecovery() {
   const stamp = String(state.currentId) + ":" + recovery(); if (stamp === state.recoveryStamp) return; state.recoveryStamp = stamp; const host = $("#recovery-host"); host.replaceChildren(); if (!recovery()) return;
@@ -207,18 +263,34 @@ function inspectorEmpty() {
 function renderInspector() {
   const session = state.current, status = session ? session.status : "pending", usage = session && session.usage || {};
   $("#inspector-status").textContent = session ? statuses[status] || status : "待开始"; $("#metric-steps").textContent = session ? session.steps || 0 : "—"; $("#metric-tools").textContent = session ? session.tool_count || session.tool_calls || 0 : "—"; $("#metric-tokens").textContent = session ? Number((usage.input_tokens || 0) + (usage.output_tokens || 0)).toLocaleString("zh-CN") : "—";
-  const data = !session ? null : state.inspector === "trace" ? session.events || [] : state.inspector === "memory" ? session.memory || [] : session.messages || [], stamp = JSON.stringify([state.currentId, state.inspector, data]); if (stamp === state.inspectorStamp) return; state.inspectorStamp = stamp;
+  const data = !session ? null : state.inspector === "trace" ? session.events || [] : state.inspector === "memory" ? session.memory || [] : state.inspector === "approvals" ? session.approvals || [] : session.messages || [], stamp = JSON.stringify([state.currentId, state.inspector, data, state.inspector === "approvals" ? session && session.approval_rules : null]); if (stamp === state.inspectorStamp) return; state.inspectorStamp = stamp;
   const children = [];
-  if (!session && state.inspector === "trace") children.push(inspectorEmpty());
-  else if (!data || !data.length) children.push(empty(state.inspector === "memory" ? "还没有会话记忆" : state.inspector === "messages" ? "等待第一条消息" : "等待第一步执行", state.inspector === "memory" ? "试试 /remember goal 掌握Agent执行循环，批准后可在这里查看。" : "发起任务后，这里会记录 Agent 的真实执行过程。", state.inspector === "memory" ? "book" : "workflow"));
+  if (state.inspector === "approvals" && session) (session.approval_rules || []).forEach(rule => children.push(ruleRow(rule, "本会话", async () => { await api("/api/sessions/" + encodeURIComponent(state.currentId) + "/rules/delete", {id: rule.id}); await refreshCurrent(); toast("规则已撤销。", "success"); })));
+  if (state.inspector === "approvals" && session && data && data.length) { data.forEach(record => children.push(approvalRecord(record))); }
+  else if (!session && state.inspector === "trace") children.push(inspectorEmpty());
+  else if (!data || !data.length) children.push(empty(state.inspector === "memory" ? "还没有会话记忆" : state.inspector === "messages" ? "等待第一条消息" : state.inspector === "approvals" ? "还没有审批记录" : "等待第一步执行", state.inspector === "memory" ? "试试 /remember goal 掌握Agent执行循环，批准后可在这里查看。" : state.inspector === "approvals" ? "需要审批的操作无论是你决定的还是被规则自动放行的，都会记录在这里。" : "发起任务后，这里会记录 Agent 的真实执行过程。", state.inspector === "memory" ? "book" : "workflow"));
   else if (state.inspector === "trace") data.forEach((event, index) => { const row = el("div", "trace-event " + event.type), body = el("div", "trace-event-body"), heading = el("div", "trace-event-heading"); heading.append(el("strong", "", eventNames[event.type] || event.type), el("time", "", time(event.time))); body.append(heading); if (event.data && event.data.name) body.append(el("code", "trace-tool-name", event.data.name)); if (event.data && event.data.step) body.append(el("span", "trace-step-label", "第 " + event.data.step + " 轮")); if (event.data && Object.keys(event.data).length) body.append(details("查看事件数据", event.data, "event-" + index)); row.append(el("span", "trace-event-dot"), body); children.push(row); });
   else if (state.inspector === "memory") data.forEach((memory, index) => { const card = el("div", "memory-card"); card.append(el("strong", "", memory.key || "记忆 " + (index + 1)), el("p", "", pretty(memory.value === undefined ? memory : memory.value))); children.push(card); });
   else data.forEach((message, index) => children.push(details(String(index + 1).padStart(2, "0") + " · " + message.role + (message.tool_calls && message.tool_calls.length ? " · 工具调用" : ""), message, "message-json-" + index)));
   preserve($("#inspector-content"), children);
 }
 
+const riskNames = {read: "只读", write: "写入工作区", exec: "执行命令 / 修改仓库", network_write: "向外部写入", destructive: "难以撤销"};
+const riskTone = {read: "success", write: "warning", exec: "warning", network_write: "warning", destructive: "danger"};
+const decisionNames = {approved: "你已批准", denied: "你已拒绝", auto: "自动放行"};
+function sourceName(source) { if (!source) return ""; if (source === "user") return "由你决定"; if (source.startsWith("rule:")) return "命中“总是允许”规则"; if (source === "default-command") return "默认命令清单"; if (source === "mode:trust") return "信任模式"; if (source === "mode:auto-workspace") return "工作区内写入"; return source; }
+function ruleRow(rule, scope, onRevoke) {
+  const row = el("div", "rule-row"), text = el("div", "rule-text"); text.append(el("strong", "", rule.label || rule.tool), el("span", "muted", " · " + scope + " · " + rule.tool));
+  const revoke = button("撤销", "button small ghost danger", guarded(async event => { const target = event.currentTarget; busy(target, true); try { await onRevoke(); } finally { busy(target, false); } })); row.append(text, revoke); return row;
+}
+function approvalRecord(record) {
+  const card = el("div", "memory-card approval-record"), head = el("div", "approval-record-head");
+  head.append(el("strong", "", record.tool), badge(decisionNames[record.decision] || record.decision, record.decision === "denied" ? "danger" : record.decision === "auto" ? "subtle" : "success"), badge(riskNames[record.risk] || record.risk, riskTone[record.risk] || "subtle"), el("time", "", time(record.created_at)));
+  card.append(head); const source = sourceName(record.source); if (source) card.append(el("p", "muted", source));
+  card.append(el("p", "approval-summary", record.summary)); if (record.feedback) card.append(el("p", "", "你的理由：" + record.feedback)); return card;
+}
 async function sendPrompt() {
-  const prompt = $("#prompt").value.trim(); if (!prompt || running() || pending() || recovery() || !state.ready) return;
+  const prompt = $("#prompt").value.trim(); if (!prompt || running() || pending() || asking() || recovery() || !state.ready) return;
   const epoch = state.chatEpoch, originalId = state.currentId; state.sending = true; state.chatNotice = ""; renderChat();
   try {
     const result = await api("/api/run", {prompt, ...(originalId ? {session_id: originalId} : {})}); trackJob(result.job_id, "run", result.session_id, {originalPrompt: prompt, originalSessionId: originalId}); state.drafts.delete(draftKey(originalId));
@@ -232,7 +304,7 @@ async function sendPrompt() {
   finally { state.sending = false; renderChat(); }
   poll();
 }
-async function approve(ids) { if (state.approving || !state.currentId) return; const id = state.currentId; state.approving = true; renderChat(); try { const result = await api("/api/sessions/" + encodeURIComponent(id) + "/approve", {approved_call_ids: ids}); trackJob(result.job_id, "run", result.session_id || id); if (id === state.currentId) await refreshCurrent(); toast(ids.length ? "已提交批准，Agent 将继续执行。" : "已拒绝写入操作，Agent 将继续处理结果。"); } finally { state.approving = false; renderChat(); } poll(); }
+async function approve(ids, extra = {}) { if (state.approving || !state.currentId) return; const id = state.currentId; state.approving = true; renderChat(); try { const result = await api("/api/sessions/" + encodeURIComponent(id) + "/approve", {approved_call_ids: ids, ...extra}); trackJob(result.job_id, "run", result.session_id || id); if (id === state.currentId) await refreshCurrent(); toast(ids.length ? (extra.remember ? "已批准并记住这类操作，Agent 将继续执行。" : "已提交批准，Agent 将继续执行。") : (extra.feedback ? "已拒绝，并把你的意见告诉了 Agent。" : "已拒绝该操作，Agent 将继续处理结果。")); } finally { state.approving = false; renderChat(); } poll(); }
 function trackJob(id, kind, sessionId = null, metadata = {}) { if (!id) throw new Error("服务未返回任务编号，请刷新后查看会话状态。"); state.jobs.set(id, {id, kind, sessionId, status: "running", eventCursor: 0, ...metadata}); updateJobButtons(); }
 function updateJobButtons() { const active = kind => [...state.jobs.values()].some(job => job.kind === kind && job.status === "running"); busy($("#run-workflow"), active("workflow")); busy($("#run-evaluation"), active("evaluate")); busy($("#test-connection"), active("connection")); }
 async function pullJobEvents(job) {
@@ -343,7 +415,7 @@ function renderToolCount() {
 }
 function renderTools() {
   renderToolCount();
-  $("#tool-grid").replaceChildren(...state.tools.map(definition => { const tool = definition.function || definition, info = toolInfo[tool.name] || [tool.name, "tools", "blue", tool.description, ""], write = definition.risk === "write" || ["write_file", "remember"].includes(tool.name), card = el("article", "card tool-definition-card"), top = el("div", "tool-definition-top"), mark = el("span", "example-icon " + info[2]); mark.append(icon(info[1])); top.append(mark, badge(write ? "需要审批" : "可直接执行", write ? "warning" : "success")); card.append(top, el("h3", "", info[0]), el("code", "tool-function-name", tool.name), el("p", "muted", info[3]), details("参数 Schema", tool.parameters, "schema-" + tool.name)); if (info[4]) card.append(button("在工作台试试 →", "text-button", () => useExample(info[4]))); return card; }));
+  $("#tool-grid").replaceChildren(...state.tools.map(definition => { const tool = definition.function || definition, info = toolInfo[tool.name] || [tool.name, "tools", "blue", tool.description, ""], write = definition.risk === "write" || ["write_file", "remember"].includes(tool.name), label = definition.interactive ? "向你提问" : write ? "需要审批" : definition.conditional_approval ? "部分操作需审批" : "可直接执行", tone = write || definition.conditional_approval ? "warning" : "success", card = el("article", "card tool-definition-card"), top = el("div", "tool-definition-top"), mark = el("span", "example-icon " + info[2]); mark.append(icon(info[1])); top.append(mark, badge(label, tone)); card.append(top, el("h3", "", info[0]), el("code", "tool-function-name", tool.name), el("p", "muted", info[3]), details("参数 Schema", tool.parameters, "schema-" + tool.name)); if (info[4]) card.append(button("在工作台试试 →", "text-button", () => useExample(info[4]))); return card; }));
 }
 function renderLessonList() {
   $("#lesson-list").replaceChildren(...lessons.map(([name, title, description], index) => { const item = button("", "lesson-item" + (state.lesson === name ? " active" : ""), () => loadLesson(name)), content = el("span", "lesson-label"); content.append(el("strong", "", title), el("small", "", description)); item.append(el("span", "lesson-index", String(index + 1).padStart(2, "0")), content, icon("chevron", "small")); return item; }));
@@ -386,8 +458,25 @@ async function startExperiment(kind) {
   catch (error) { busy(target, false); throw error; }
   poll();
 }
+const approvalModeHelp = {
+  "auto-workspace": "工作区内的文件写入与记忆写入自动放行；运行命令、git 提交、联网写入等仍然询问，只有默认清单里的查看与测试命令（见下方）例外。注意：自动放行测试命令，意味着 Agent 刚写下的代码可以不经确认地被执行。",
+  ask: "每个会改动东西的操作都先问你。你可以在审批卡片里选择“总是允许”某一类操作，之后这类操作不再询问。",
+  trust: "所有操作自动执行，包括命令、联网写入和 rm -rf、强制推送这类难以撤销的操作。只在你完全信任当前任务和它读取的内容时使用——网页和文档里的恶意指令也可能被执行。",
+};
+function updateApprovalModeHelp() {
+  const select = $("#config-approval-mode"); if (!select) return;
+  $("#approval-mode-help").textContent = approvalModeHelp[select.value] || ""; show($("#trust-ack-field"), select.value === "trust");
+}
+function renderRules(rules) {
+  const host = $("#approval-rules"); if (!host) return; state.rules = rules;
+  $("#rule-count").textContent = rules.length ? "（" + rules.length + "）" : "";
+  if (!rules.length) { host.replaceChildren(el("p", "field-help", "还没有。在审批卡片里选择“所有会话总是允许”后，规则会出现在这里。")); return; }
+  host.replaceChildren(...rules.map(rule => ruleRow(rule, "所有会话", async () => { const result = await api("/api/approval/rules/delete", {id: rule.id}); renderRules(result.rules || []); toast("规则已撤销。", "success"); })));
+}
+async function refreshRules() { try { renderRules((await api("/api/approval/rules")).rules || []); } catch (_) { /* 规则列表只是展示，失败不影响其他功能 */ } }
 async function saveSettings(event) {
   event.preventDefault(); const payload = {provider: $("#config-provider").value, model: $("#config-model").value.trim(), base_url: $("#config-base-url").value.trim()}, key = $("#config-api-key");
+  const mode = $("#config-approval-mode"); if (mode) { payload.approval_mode = mode.value; if (mode.value === "trust" && !$("#config-trust-ack").checked) { toast("信任模式需要先勾选确认，表示你了解它的风险。", "error"); return; } }
   if (key.value.trim()) payload.api_key = key.value.trim();
   const searchBackend = $("#config-search-backend"), searchKey = $("#config-search-key"), searxUrl = $("#config-searx-url");
   if (searchBackend) payload.search_backend = searchBackend.value;
@@ -416,10 +505,10 @@ async function testConnection() {
   catch (error) { host.className = "connection-result error"; host.textContent = error.message; busy($("#test-connection"), false); throw error; }
   poll();
 }
-function useExample(prompt) { navigate("chat"); if (running() || pending() || recovery()) { toast("请先完成当前会话的运行或审批，也可以新建对话。", "error"); return; } $("#prompt").value = prompt; saveDraft(); renderChat(); $("#prompt").focus(); }
+function useExample(prompt) { navigate("chat"); if (running() || pending() || asking() || recovery()) { toast("请先完成当前会话的运行、审批或回答，也可以新建对话。", "error"); return; } $("#prompt").value = prompt; saveDraft(); renderChat(); $("#prompt").focus(); }
 async function bootstrap() {
   busy($("#retry-bootstrap"), true);
-  try { const result = await api("/api/bootstrap"); state.csrf = result.csrf_token; state.tools = result.tools || []; state.ready = true; applyConfig(result.config); renderTools(); renderLessonList(); if (result.stats) $("#knowledge-count").textContent = result.stats.documents || 0; show($("#boot-error"), false); if (result.warning) { toast(result.warning, "error"); $("#settings-saved-status").textContent = "配置需修复"; } await refreshSessions(); renderChat(); renderInspector(); if (state.view === "knowledge") await refreshKnowledge();
+  try { const result = await api("/api/bootstrap"); state.csrf = result.csrf_token; state.tools = result.tools || []; state.ready = true; applyConfig(result.config); refreshRules(); renderTools(); renderLessonList(); if (result.stats) $("#knowledge-count").textContent = result.stats.documents || 0; show($("#boot-error"), false); if (result.warning) { toast(result.warning, "error"); $("#settings-saved-status").textContent = "配置需修复"; } await refreshSessions(); renderChat(); renderInspector(); if (state.view === "knowledge") await refreshKnowledge();
   if (state.view === "files") await refreshFiles(); if (state.view === "learning") loadLesson(state.lesson); }
   catch (error) { state.ready = false; $("#boot-error-message").textContent = error.message; show($("#boot-error"), true); renderChat(); }
   finally { busy($("#retry-bootstrap"), false); }
@@ -439,7 +528,7 @@ $("#refresh-files").addEventListener("click", guarded(refreshFiles));
 $("#workspace-upload").addEventListener("change", guarded(uploadWorkspaceFiles));
 $("#retry-bootstrap").addEventListener("click", bootstrap);
 $("#chat-form").addEventListener("submit", guarded(async event => { event.preventDefault(); await sendPrompt(); }));
-$("#prompt").addEventListener("input", () => { saveDraft(); $("#send-message").disabled = !state.ready || running() || pending() || recovery() || !$("#prompt").value.trim(); });
+$("#prompt").addEventListener("input", () => { saveDraft(); $("#send-message").disabled = !state.ready || running() || pending() || asking() || recovery() || !$("#prompt").value.trim(); });
 $("#prompt").addEventListener("keydown", event => { if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); $("#chat-form").requestSubmit(); } });
 $("#cancel-run").addEventListener("click", guarded(async () => { const job = currentJob(); if (!job || state.cancelling) return; state.cancelling = true; renderChat(); try { await api("/api/cancel", {job_id: job.id}); toast("已请求停止当前任务。"); } finally { state.cancelling = false; renderChat(); } poll(); }));
 $$("[data-inspect]").forEach(element => element.addEventListener("click", () => { state.inspector = element.dataset.inspect; $$("[data-inspect]").forEach(tab => { const active = tab === element; tab.classList.toggle("active", active); tab.setAttribute("aria-selected", String(active)); }); renderInspector(); }));
@@ -447,6 +536,7 @@ $("#knowledge-files").addEventListener("change", guarded(importFiles));
 $("#knowledge-search-form").addEventListener("submit", guarded(searchKnowledge));
 $("#import-example").addEventListener("click", guarded(async event => { const target = event.currentTarget; busy(target, true); try { await api("/api/knowledge/example", {}); await refreshKnowledge(); toast("示例知识已导入，试试搜索 Agent 记忆。"); } finally { busy(target, false); } }));
 $("#settings-form").addEventListener("submit", guarded(saveSettings));
+$("#config-approval-mode").addEventListener("change", updateApprovalModeHelp);
 $("#test-connection").addEventListener("click", guarded(testConnection));
 $("#run-workflow").addEventListener("click", guarded(() => startExperiment("workflow")));
 $("#run-evaluation").addEventListener("click", guarded(() => startExperiment("evaluate")));

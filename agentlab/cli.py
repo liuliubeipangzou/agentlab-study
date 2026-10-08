@@ -9,16 +9,20 @@ import tempfile
 from pathlib import Path
 
 from .agent import Agent, AgentConfig, SessionError
+from .approvals import MODES, RISK_LABELS, build_preview
 from .evaluation import EvalCase, evaluate
 from .providers import DemoProvider, ProviderError, provider_from_env
 from .storage import SQLiteStore
 from .tools import create_builtin_tools
+from .types import ToolCall
 
 
 def _budget_flags(args):
+    """需要原样带进“批准/拒绝/回答”提示命令的全局选项。"""
     return [(flag, getattr(args, name)) for flag, name in (
         ("--max-steps", "max_steps"), ("--max-tool-calls", "max_tool_calls"),
-        ("--max-tokens", "max_tokens"), ("--timeout", "timeout")) if getattr(args, name, None) is not None]
+        ("--max-tokens", "max_tokens"), ("--timeout", "timeout"),
+        ("--approval-mode", "approval_mode")) if getattr(args, name, None) is not None]
 
 
 def _config_from_args(args):
@@ -28,7 +32,17 @@ def _config_from_args(args):
         value = getattr(args, name, None)
         if value is not None:
             overrides[field] = value
-    return AgentConfig(**overrides)
+    # 命令行与浏览器界面默认让工作区内的写入自动放行；库里直接构造 Agent 仍默认逐次询问。
+    mode = getattr(args, "approval_mode", None) or os.environ.get("AGENTLAB_APPROVAL_MODE", "").strip().lower() \
+        or "auto-workspace"
+    return AgentConfig(approval_mode=mode, **overrides)
+
+
+def _asked_ids(agent, state):
+    """必须由用户决定的调用：需要审批、且没有被审批策略自动放行。"""
+    decisions = state.get("decisions", {})
+    return [x["id"] for x in state.get("pending", [])
+            if agent.tools.requires_approval(ToolCall.from_dict(x)) and x["id"] not in decisions]
 
 
 def parser():
@@ -47,6 +61,9 @@ def parser():
     root.add_argument("--max-tool-calls", type=int, default=None, help="单次运行的最大工具调用次数")
     root.add_argument("--max-tokens", type=int, default=None, help="单次运行累计 token 上限")
     root.add_argument("--timeout", type=float, default=None, help="单次运行的时间预算（秒，不含等待审批）")
+    root.add_argument("--approval-mode", choices=MODES, default=None,
+                      help="审批模式：ask 逐次询问；auto-workspace（默认）工作区内写入与默认清单里的命令自动放行；"
+                           "trust 全部自动放行（含难以撤销的操作，请谨慎）。也可用环境变量 AGENTLAB_APPROVAL_MODE")
     sub = root.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="执行一次任务")
     run.add_argument("prompt")
@@ -61,7 +78,21 @@ def parser():
     selection = approve.add_mutually_exclusive_group(required=True)
     selection.add_argument("--all", action="store_true", help="批准当前检查点的全部写入")
     selection.add_argument("--call", action="append", default=[], help="批准指定调用 ID，可重复")
-    for name, help_text in [("deny", "拒绝待审批操作并继续"), ("inspect", "查看会话检查点"),
+    approve.add_argument("--remember", choices=("session", "global"),
+                         help="同时记住这类操作：之后同类调用自动放行（难以撤销的操作不会被记住）")
+    approve.add_argument("--reason", help="给未被批准的调用附上理由，会告诉模型")
+    deny = sub.add_parser("deny", help="拒绝待审批操作并继续")
+    deny.add_argument("session")
+    deny.add_argument("--reason", help="拒绝理由，会告诉模型，让它按你的意见调整做法")
+    approvals = sub.add_parser("approvals", help="查看会话的审批记录（含自动放行与来源）")
+    approvals.add_argument("session")
+    rules = sub.add_parser("rules", help="列出或撤销全局的“总是允许”规则")
+    rules.add_argument("--delete", metavar="RULE_ID", help="撤销指定规则")
+    answer = sub.add_parser("answer", help="回答 Agent 通过 ask_user 提出的问题并继续")
+    answer.add_argument("session")
+    answer.add_argument("text", help="你的回答")
+    answer.add_argument("--call", help="问题的调用 ID；会话只有一个待回答问题时可省略")
+    for name, help_text in [("inspect", "查看会话检查点"),
                             ("trace", "查看事件轨迹"), ("recover", "结束中断的运行，不重放工具"),
                             ("delete", "删除会话及其事件与记忆")]:
         command = sub.add_parser(name, help=help_text)
@@ -121,7 +152,40 @@ def _tool_settings_from_env():
     return settings
 
 
-def show_result(result, as_json=False, args=None, streamed=False):
+def _question_id(store, session, explicit=None):
+    """待回答问题的调用 ID：显式给出则直接用，否则取会话里唯一的提问。"""
+    if explicit:
+        return explicit
+    state = store.load_session(session)
+    if not state:
+        raise SessionError("未找到会话：" + str(session))
+    asking = [x["id"] for x in state.get("pending", []) if x.get("name") == "ask_user"]
+    if len(asking) != 1:
+        raise SessionError("该会话没有待回答的问题" if not asking else "有多个待回答的问题，请用 --call 指定")
+    return asking[0]
+
+
+def _print_pending(result, agent):
+    """逐个展示待用户决定的调用：风险等级与预览（文件改动显示 diff，命令原样显示）。"""
+    state = agent.store.load_session(result.session_id) or {}
+    decisions = state.get("decisions", {})
+    shown = 0
+    for raw in result.pending:
+        call = ToolCall.from_dict(raw)
+        risk = agent.tools.call_risk(call)
+        if risk == "read" or call.id in decisions:
+            continue
+        shown += 1
+        preview = build_preview(call, agent.workspace)
+        print("\n[%d] %s · 风险：%s · id=%s" % (shown, call.name, RISK_LABELS.get(risk, risk), call.id))
+        print("    " + preview["title"])
+        for line in preview["text"].splitlines():
+            print("    | " + line)
+    if not shown:
+        emit(result.pending)
+
+
+def show_result(result, as_json=False, args=None, streamed=False, agent=None):
     if as_json:
         emit(result.to_dict())
         return
@@ -132,17 +196,29 @@ def show_result(result, as_json=False, args=None, streamed=False):
         print("\n" + result.output)
     print("\n[{}] session={} · steps={} · tools={} · tokens={}".format(
         result.status, result.session_id, result.steps, result.tool_calls, result.usage.total_tokens))
-    if result.status == "waiting_approval":
-        print("待执行参数：")
-        emit(result.pending)
+    if result.status in ("waiting_approval", "waiting_input"):
         base = ["python3", "-m", "agentlab"]
         if args is not None:
             base += ["--provider", args.provider, "--data-dir", str(Path(args.data_dir).resolve()),
                      "--workspace", str(Path(args.workspace).resolve())]
             for flag, value in _budget_flags(args):
                 base += [flag, str(value)]
-        print("批准：" + shlex.join(base + ["approve", result.session_id, "--all"]))
-        print("拒绝：" + shlex.join(base + ["deny", result.session_id]))
+    if result.status == "waiting_input":
+        for call in result.pending:
+            if call.get("name") == "ask_user":
+                options = call["arguments"].get("options") or []
+                if options:
+                    print("备选项：" + " / ".join(options))
+                print("回答：" + shlex.join(base + ["answer", result.session_id, "你的回答", "--call", call["id"]]))
+    if result.status == "waiting_approval":
+        if agent is not None:
+            _print_pending(result, agent)
+        else:
+            print("待执行参数：")
+            emit(result.pending)
+        print("\n批准：" + shlex.join(base + ["approve", result.session_id, "--all"]))
+        print("批准并记住这类操作：" + shlex.join(base + ["approve", result.session_id, "--all", "--remember", "session"]))
+        print("拒绝：" + shlex.join(base + ["deny", result.session_id, "--reason", "你的意见"]))
 
 
 async def run_workflow(agent):
@@ -196,6 +272,17 @@ async def dispatch(args):
         if args.command == "sessions":
             emit(store.list_sessions())
             return 0
+        if args.command == "approvals":
+            if not store.load_session(args.session):
+                raise SessionError("未找到会话：" + args.session)
+            emit(store.list_approvals(args.session))
+            return 0
+        if args.command == "rules":
+            if args.delete:
+                if not store.delete_approval_rule(args.delete):
+                    raise SessionError("未找到规则：" + args.delete)
+            emit(store.list_approval_rules())
+            return 0
         if args.command in ("inspect", "trace"):
             state = store.load_session(args.session)
             if not state:
@@ -221,11 +308,14 @@ async def dispatch(args):
             state = store.load_session(args.session)
             if not state:
                 raise SessionError("未找到会话")
-            from .types import ToolCall
-            approved = [x["id"] for x in state.get("pending", []) if agent.tools.requires_approval(ToolCall.from_dict(x))] if args.all else args.call
-            result = await agent.resume(args.session, approved, on_delta=on_delta)
+            approved = _asked_ids(agent, state) if args.all else args.call
+            result = await agent.resume(args.session, approved, on_delta=on_delta,
+                                        feedback=args.reason, remember=args.remember)
         elif args.command == "deny":
-            result = await agent.resume(args.session, [], on_delta=on_delta)
+            result = await agent.resume(args.session, [], on_delta=on_delta, feedback=args.reason)
+        elif args.command == "answer":
+            result = await agent.answer(args.session, _question_id(store, args.session, args.call), args.text,
+                                        on_delta=on_delta)
         elif args.command == "recover":
             result = agent.recover(args.session)
         elif args.command == "delete":
@@ -250,24 +340,37 @@ async def dispatch(args):
                     continue
                 try:
                     on_delta = _delta_printer(args)
-                    if prompt in ("/approve", "/deny"):
-                        state = store.load_session(session) if session else None
+                    awaiting = store.load_session(session) if session else None
+                    command, _, rest = prompt.partition(" ")
+                    if command in ("/approve", "/deny"):
+                        state = awaiting
                         if not state:
                             raise SessionError("当前没有会话")
-                        from .types import ToolCall
-                        ids = [x["id"] for x in state.get("pending", []) if agent.tools.requires_approval(ToolCall.from_dict(x))] if prompt == "/approve" else []
-                        result = await agent.resume(session, ids, on_delta=on_delta)
+                        if command == "/approve":
+                            # /approve [session|global]：批准并记住这类操作；直接 /approve 只批准这一次。
+                            if rest.strip() not in ("", "session", "global"):
+                                raise ValueError("用法：/approve [session|global]")
+                            result = await agent.resume(session, _asked_ids(agent, state), on_delta=on_delta,
+                                                        remember=rest.strip() or None)
+                        else:
+                            # /deny [理由]：理由会告诉模型，让它按你的意见调整做法。
+                            result = await agent.resume(session, [], on_delta=on_delta, feedback=rest.strip() or None)
+                    elif awaiting and awaiting.get("status") == "waiting_input":
+                        # Agent 正在提问：这一行就是回答，不是新任务。
+                        result = await agent.answer(session, _question_id(store, session), prompt, on_delta=on_delta)
                     else:
                         result = await agent.run(prompt, session, on_delta=on_delta)
                     session = result.session_id
-                    show_result(result, args.json, args, streamed=_already_streamed(result, on_delta))
+                    show_result(result, args.json, args, streamed=_already_streamed(result, on_delta), agent=agent)
                     if result.status == "waiting_approval":
-                        print("在聊天中输入 /approve 批准以上参数，或 /deny 拒绝。")
+                        print("在聊天中输入 /approve 批准（/approve session 同时记住这类操作），或 /deny 理由 拒绝。")
+                    elif result.status == "waiting_input":
+                        print("直接输入你的回答即可。")
                 except (SessionError, ValueError) as exc:
                     print(str(exc), file=sys.stderr)
             return 0
-        show_result(result, args.json, args, streamed=_already_streamed(result, on_delta))
-        return 0 if result.status in ("completed", "waiting_approval") else 1
+        show_result(result, args.json, args, streamed=_already_streamed(result, on_delta), agent=agent)
+        return 0 if result.status in ("completed", "waiting_approval", "waiting_input") else 1
     finally:
         store.close()
 

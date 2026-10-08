@@ -215,13 +215,15 @@ def search(query, limit=5, config=None):
     return results
 
 
-def fetch(url, limit=20000, raw=False, timeout=SEARCH_TIMEOUT):
+def fetch(url, limit=20000, raw=False, timeout=SEARCH_TIMEOUT, offset=0):
     """抓取一个 URL。
 
     `raw=False`（默认）时把 HTML 转为纯文本；`raw=True` 返回原始内容。
     """
     if type(limit) is not int or not 128 <= limit <= 200000:
         raise SearchError("limit 必须在 128 到 200000 之间")
+    if type(offset) is not int or not 0 <= offset <= 2000000:
+        raise SearchError("offset 必须在 0 到 2000000 之间")
     if not isinstance(url, str) or not url.strip():
         raise SearchError("URL 不能为空")
     candidate = url.strip()
@@ -241,12 +243,16 @@ def fetch(url, limit=20000, raw=False, timeout=SEARCH_TIMEOUT):
     if not text:
         raise SearchError("该 URL 返回的是非文本内容（%s），无法读取正文"
                           % (response["content_type"] or "未知类型"))
+    end = offset + limit
     if raw:
+        more = len(text) > end
         return {"url": response["final_url"], "content_type": response["content_type"],
-                "text": text[:limit], "truncated": len(text) > limit,
-                "bytes": response["bytes"]}
-    extracted = netguard.html_to_text(text, limit=limit)
+                "text": text[offset:end], "truncated": more, "bytes": response["bytes"],
+                "next_offset": end if more else None}
+    # html_to_text 在超出上限时会附加提示语，所以按 end 截取并用长度判断是否还有后续。
+    extracted = netguard.html_to_text(text, limit=end)
     body = extracted["text"]
-    truncated = len(extracted["text"]) > limit or response["truncated"]
+    more = len(body) > end
     return {"url": response["final_url"], "title": extracted["title"],
-            "text": body[:limit], "truncated": truncated, "bytes": response["bytes"]}
+            "text": body[offset:end], "truncated": more or response["truncated"],
+            "bytes": response["bytes"], "next_offset": end if more else None}

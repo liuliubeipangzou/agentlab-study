@@ -14,3 +14,37 @@
 @media(max-height:820px) and (min-width:1001px){.main-shell{padding-top:23px}.workspace-header{margin-bottom:20px}.chat-column,.inspector{max-height:calc(100vh - 130px)}.chat-layout{min-height:calc(100vh - 130px)}.messages{padding:22px}.welcome{padding:0;margin:0 auto 10px}.welcome-symbol{display:none}.welcome>.eyebrow{display:none}.welcome h2{font-size:23px;line-height:1.45;margin:8px 0 9px}.welcome h2 br{display:none}.welcome>p{font-size:12px;line-height:1.85;margin-bottom:10px}.welcome>p br{display:none}.capability-pills{display:none}.welcome .example-grid{margin-top:19px;gap:10px}.welcome .example-icon{display:none}.welcome .example-card{padding:16px 15px;gap:7px}.welcome .example-card>span:last-child{font-size:11px}.composer-wrap{padding-bottom:12px}.composer-footnote>span:last-child{display:none}.inspector-tip{padding:10px}.sidebar{gap:20px;padding-top:24px}}
 @media(max-width:700px){.recent-sessions,.recent-heading,.sidebar-footer,.nav-label{display:none}.sidebar{gap:15px}.sidebar .new-chat-button{width:auto!important}.primary-nav{margin-top:4px}.header-heading .mobile-menu{display:none}.workspace-header .breadcrumb{font-size:10px}.workspace-header .badge{display:none}.workspace-header .header-actions>.icon-button{display:none}.header-actions .model-selector{font-size:11px;max-width:165px;overflow:hidden}.model-selector #model-label{white-space:nowrap;text-overflow:ellipsis;overflow:hidden}.mode-banner{font-size:11px;flex-wrap:wrap;gap:5px;padding:10px 13px}.mode-banner .text-button{margin-left:21px;font-size:11px}.welcome h2{font-size:23px}.welcome-symbol{width:40px;height:40px;margin-bottom:18px}.capability-pills{font-size:10px;gap:10px}.welcome .example-card{padding:13px}.welcome .example-card strong{font-size:12px}.welcome .example-card>span:last-child{font-size:11px}.welcome .example-card .example-icon{display:none}.composer-footnote>span:last-child,.composer-shortcut{display:none}.composer-wrap{padding:0 15px 13px}.composer-hints{font-size:10px}.page-intro{flex-direction:column;align-items:flex-start;gap:12px}.page-intro h2{font-size:20px}.stat-grid{gap:9px}.stat-card{padding:13px 12px}.stat-card>span{font-size:10px}.stat-card strong{font-size:24px}.stat-card strong.stat-word{font-size:19px}.stat-card small{font-size:9px}.workflow-diagram{grid-template-columns:1fr 25px 1fr;gap:12px 5px}.workflow-node{padding:14px}.workflow-node .node-status{position:static;display:block;margin-top:8px;font-size:10px}.inspector-tip p{font-size:11px}.toast-host{left:50%}}.mode-banner.needs-key{background:#fff8ec;border-bottom-color:#f5e3c4;color:#a9863f}.mode-banner.needs-key .banner-icon .icon{color:#d3a24b}.mode-banner.needs-key .text-button{color:#b9852d}.mode-banner.needs-key .text-button:hover{color:#8f6519}.stream-preview{margin:0 0 14px;padding:11px 14px;border:1px dashed #cfdaf1;border-radius:9px;background:#f8faff;color:#6d7f9e;font-size:13px;line-height:1.8;white-space:pre-wrap;overflow-wrap:anywhere}.stream-preview:before{content:'正在生成';display:block;font-size:10px;letter-spacing:1px;color:#9aabd0;margin-bottom:5px}.workspace-file-card .source-item{display:flex;flex-wrap:wrap;align-items:center;gap:8px}.workspace-file-card .source-item>div:first-child{flex:1;min-width:0}.workspace-file-card .source-item .text-button{flex-shrink:0}.checkbox-field{display:flex;align-items:center;gap:8px;font-size:12px;color:#7b8aa3;margin:10px 0 0}.checkbox-field input{width:15px;height:15px;accent-color:#5b78e6}
 .section-gap { margin-top: 18px; }
+.question-card { background: #f6f9ff; border-color: #d4def7; }
+.question-card .approval-heading { color: #4f6bd0; }
+.question-card h3 { color: #3f58b3; }
+.question-text { color: #3d4c6a; font-size: 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.question-card .approval-actions { align-items: stretch; }
+.question-input { flex: 1; min-width: 200px; border: 1px solid #cdd8f2; border-radius: 8px; padding: 9px 12px; background: #fff; }
+.session-status.waiting_input { background: #6f8bea; }
+.todo-card { margin: 10px 0 16px; padding: 14px 18px; border: 1px solid #e0e7f5; border-radius: 11px; background: #fbfcff; }
+.todo-heading { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; font-size: 13px; }
+.todo-list { list-style: none; margin: 0; padding: 0; }
+.todo-item { display: flex; gap: 10px; align-items: baseline; padding: 4px 0; font-size: 13px; color: #62708a; }
+.todo-item.completed { color: #9aa6ba; text-decoration: line-through; }
+.todo-item.in_progress { color: #3f58b3; font-weight: 600; }
+.todo-mark { width: 14px; flex-shrink: 0; text-align: center; font-size: 11px; }
+.todo-text { overflow-wrap: anywhere; }
+.rule-list { display: flex; flex-direction: column; gap: 8px; }
+.rule-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; border: 1px solid #e0e7f5; border-radius: 8px; background: #fbfcff; font-size: 13px; }
+.rule-text { min-width: 0; overflow-wrap: anywhere; }
+.approval-record { padding: 12px 14px; }
+.approval-record-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 4px; }
+.approval-record-head time { margin-left: auto; font-size: 11px; color: #adbbd3; }
+.approval-summary { font-family: "SFMono-Regular", Consolas, monospace; font-size: 11px; color: #7b8caa; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 90px; overflow: auto; }
+.approval-preview { margin-top: 8px; }
+.approval-preview-title { font-size: 12px; color: #7a6a4c; margin: 0 0 4px; }
+.approval-preview pre { margin: 0; max-height: 280px; }
+.preview-command, .preview-code { background: #1d2538; color: #e3e9ff; border-color: #2c3753; }
+.diff-line { display: block; }
+.diff-add { background: #e6f6ee; color: #1d6b4a; }
+.diff-del { background: #fdeceb; color: #a1343f; }
+.diff-hunk { color: #6c7fd1; }
+.diff-file { color: #8a94a8; font-weight: 600; }
+.approval-remember { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; color: #7a6a4c; }
+.approval-remember select, .deny-reason { border: 1px solid #e6d9bb; border-radius: 8px; padding: 7px 10px; background: #fff; font-size: 13px; }
+.deny-reason { width: 100%; margin-top: 10px; }

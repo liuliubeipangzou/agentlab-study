@@ -94,6 +94,15 @@ class SQLiteStore:
                 CREATE TABLE IF NOT EXISTS session_leases (
                     session_id TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS approval_rules (
+                    id TEXT PRIMARY KEY, rule TEXT NOT NULL, created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS approvals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, call_id TEXT NOT NULL,
+                    tool TEXT NOT NULL, risk TEXT NOT NULL, decision TEXT NOT NULL, source TEXT NOT NULL,
+                    summary TEXT NOT NULL, feedback TEXT NOT NULL, created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS approvals_session ON approvals(session_id, id);
                 CREATE TABLE IF NOT EXISTS documents (
                     source TEXT PRIMARY KEY, content_hash TEXT NOT NULL, indexed_at TEXT NOT NULL
                 );
@@ -143,10 +152,44 @@ class SQLiteStore:
 
     def delete_session(self, session_id: str) -> None:
         with self._lock, self._connection:
-            for table in ("events", "memories", "session_leases", "sessions"):
+            for table in ("events", "memories", "approvals", "session_leases", "sessions"):
                 self._connection.execute(
                     "DELETE FROM {} WHERE session_id=?".format(table), (session_id,)
                 )
+
+    # ---- 审批：全局规则与审计 ----
+    def add_approval_rule(self, rule: Dict[str, Any]) -> None:
+        if not isinstance(rule, dict) or not isinstance(rule.get("id"), str) or not rule["id"]:
+            raise ValueError("rule must be a dictionary with a string id")
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR REPLACE INTO approval_rules(id, rule, created_at) VALUES (?, ?, ?)",
+                (rule["id"], _json(rule), time.time()))
+
+    def list_approval_rules(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute("SELECT rule FROM approval_rules ORDER BY created_at, id").fetchall()
+        return [json.loads(row["rule"]) for row in rows]
+
+    def delete_approval_rule(self, rule_id: str) -> bool:
+        with self._lock, self._connection:
+            return self._connection.execute("DELETE FROM approval_rules WHERE id=?", (rule_id,)).rowcount > 0
+
+    def record_approval(self, session_id: str, call_id: str, tool: str, risk: str, decision: str,
+                        source: str = "", summary: str = "", feedback: str = "") -> None:
+        """审计一次审批结果：decision 为 approved / denied / auto。"""
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO approvals(session_id, call_id, tool, risk, decision, source, summary, feedback, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, call_id, tool, risk, decision, source, summary[:500], feedback[:2000], time.time()))
+
+    def list_approvals(self, session_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT call_id, tool, risk, decision, source, summary, feedback, created_at FROM approvals "
+                "WHERE session_id=? ORDER BY id DESC LIMIT ?", (session_id, limit)).fetchall()
+        return [dict(row) for row in reversed(rows)]
 
     def append_event(self, session_id: str, event: Dict[str, Any]) -> None:
         if not isinstance(event, dict):

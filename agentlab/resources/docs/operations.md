@@ -13,7 +13,8 @@
 | format_retries | 2 | 模型返回非法工具参数、空响应或被截断时，带纠正提示重试的次数；纠正提示不写入历史 |
 | summarize_history | True | 上下文超限时用模型把较早的轮次压缩成滚动摘要（完整历史仍保存在会话里）；摘要失败则退回到整轮裁剪 |
 | wrap_up | True | 步数、token 或工具次数触顶时，再发一次不带工具的调用让模型交代进展，会话可回复“继续”接着做；该调用允许略微超出预算 |
-| system_prompt | 中文工作助手提示 | 可替换的应用行为描述；每次调用会附上当前日期和历史摘要 |
+| system_prompt | 中文工作助手提示 | 可替换的应用行为描述；每次调用会附上当前日期、历史摘要与待办清单 |
+| approval_mode | ask | `ask` 逐次询问；`auto-workspace` 工作区内写入与默认清单里的命令自动放行；`trust` 全部自动。库里直接构造 Agent 默认 `ask`，命令行与浏览器默认 `auto-workspace` |
 
 token 预算在响应后累计，达到限制便停止继续调用。它不是严格费用封顶：单次请求可能越过预算，重试也可能计费；未返回 usage 的兼容服务按 0 记录。若要更紧的控制，请同时设置 Provider 的 `max_output_tokens`、`max_retries` 和 Agent 步数。
 
@@ -30,6 +31,23 @@ config = AgentConfig(max_steps=5, max_tool_calls=8, run_timeout=60,
 # 需要旧版（演示级）的紧预算时：
 config = AgentConfig(max_steps=8, max_tool_calls=16, max_total_tokens=20000, run_timeout=120)
 ```
+
+## 审批策略
+
+工具调用的风险等级由 `ToolRegistry.call_risk(call)` 给出：`read`、`write`、`exec`、`network_write`、`destructive`。除 `read` 外都需要审批。同一个工具的风险可以随参数变化——注册时给 `Tool` 传 `risk_of=callable`（并配套稳定的 `approval_policy` ID）：`git` 的 `status` 是 `read`，`commit` 是 `exec`，`push` 是 `network_write`，`reset --hard` 是 `destructive`；`http_request` 的 GET 是 `read`，POST 是 `network_write`；`run_shell` 对 `rm`、`sudo`、`git reset --hard` 等做启发式识别并按 `destructive` 处理（shell 字符串无法被可靠分析，没命中不代表安全）。`risk_of` 抛出异常或返回未知值时按 `destructive` 处理（fail closed）。
+
+`ApprovalPolicy.decide(call, risk, session_rules)` 决定一次需要审批的调用是否自动放行：
+
+1. `trust` 模式：全部放行。
+2. `auto-workspace` 模式：`write` 放行；`run_shell` 的 `exec` 命令若满足下面三条则放行——不含 shell 元字符（`; & | \` $ < > ( )`、换行、反斜杠）、没有绝对路径/`~`/`..` 之类指向工作区之外的参数、且以 `DEFAULT_ALLOWED_COMMANDS` 中某一项为 token 前缀。
+3. 其余按用户记住的规则（会话级在 `state["approval_rules"]`，全局在 `approval_rules` 表）匹配。规则种类：`command_prefix`（命令 token 前缀）、`git_sub`（git 子命令）、`host`（HTTP 主机）、`tool`（仅限 `write` 级工具）。**`destructive` 永远不匹配规则**；带 shell 元字符的命令也不会命中 `command_prefix`。
+4. 都不满足则暂停等待用户。
+
+执行顺序：同一批调用按顺序执行，排在前面的只读调用先执行；走到第一个必须由用户决定的调用才暂停（`waiting_approval`），并把此后所有待决定的调用一起交给用户。被策略自动放行的调用写入 `state["decisions"]` 并发出 `approval_auto` 事件，不会出现在待用户决定的列表里。`resume(session, approved_ids, feedback=..., remember="session"|"global")`：`feedback` 连同拒绝一起回灌给模型；`remember` 把本次批准的调用归纳成规则（见 `approvals.suggest_rule`：不为 `curl`、`find`、`sed`、裸 `python -c` 这类“一个词就能做任何事”的命令，也不为 `destructive` 提供规则）。
+
+所有决定都写入 `approvals` 审计表（自动/批准/拒绝、来源、风险、参数摘要、拒绝理由），`agentlab approvals SESSION` 或会话接口的 `approvals` 字段可查看；删除会话时一并清除。工具集在等待期间发生变化时，已批准与已自动放行但尚未执行的调用一律取消，不沿用旧批准。
+
+**自动放行不等于安全。** `auto-workspace` 放行测试/构建命令，意味着 Agent 刚写下的代码可以不经确认地运行；工具对 `.git/`、`.env*` 的保护只约束文件工具，不约束命令。需要更强的隔离时使用 `ask` 模式，并在容器或受限账户中运行。
 
 ## 支持范围
 
